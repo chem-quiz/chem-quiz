@@ -1,230 +1,156 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <!-- =========================================================
-         INFINITYFREE STUDENT FRONTEND -> GOOGLE APPS SCRIPT BRIDGE
-         This frontend remains hosted on InfinityFree.
-         Bridge.html remains hosted by Google Apps Script.
-         ========================================================= -->
-    <script>
-      const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzSZnpADHzS83OwPzkh7SaGqZyL2ZIrIXBTJ7W-GU7VYkditeD_9ALK9zUknbJ-dPbRtQ/exec?page=bridge';
+<script>
+(function () {
+  'use strict';
 
-      let gasBridgeReady = false;
-      let gasBridgeFrame = null;
-      let gasBridgeSequence = 0;
-      const gasBridgeQueue = [];
-      const gasBridgePending = Object.create(null);
+  const GAS_WEB_APP_URL =
+    'https://script.google.com/macros/s/AKfycbzSZnpADHzS83OwPzkh7SaGqZyL2ZIrIXBTJ7W-GU7VYkditeD_9ALK9zUknbJ-dPbRtQ/exec?page=bridge';
 
-      /*
-       * Emulates the Google Apps Script google.script.run builder.
-       * The existing Chem-Quiz frontend can therefore continue using:
-       *
-       * google.script.run
-       *   .withSuccessHandler(...)
-       *   .withFailureHandler(...)
-       *   .someServerFunction(...);
-       */
-      function createGasRunner(successHandler, failureHandler, userObject) {
-        const handlers = {
-          success: typeof successHandler === 'function' ? successHandler : null,
-          failure: typeof failureHandler === 'function' ? failureHandler : null,
-          userObject: userObject
+  let gasBridgeReady = false;
+  let gasBridgeFrame = null;
+  const gasBridgeQueue = [];
+  const gasBridgePending = {};
+
+  function createGasRunner(successHandler, failureHandler, userObject) {
+    const handlers = {
+      success: typeof successHandler === 'function' ? successHandler : null,
+      failure: typeof failureHandler === 'function' ? failureHandler : null,
+      userObject: userObject
+    };
+
+    return new Proxy({}, {
+      get: function (target, prop) {
+        if (prop === 'withSuccessHandler') {
+          return function (fn) {
+            return createGasRunner(fn, handlers.failure, handlers.userObject);
+          };
+        }
+        if (prop === 'withFailureHandler') {
+          return function (fn) {
+            return createGasRunner(handlers.success, fn, handlers.userObject);
+          };
+        }
+        if (prop === 'withUserObject') {
+          return function (obj) {
+            return createGasRunner(handlers.success, handlers.failure, obj);
+          };
+        }
+        return function () {
+          gasBridgeCall(
+            String(prop),
+            Array.prototype.slice.call(arguments),
+            handlers.success,
+            handlers.failure,
+            handlers.userObject
+          );
         };
-
-        return new Proxy({}, {
-          get: function(target, prop) {
-            if (prop === 'withSuccessHandler') {
-              return function(fn) {
-                return createGasRunner(fn, handlers.failure, handlers.userObject);
-              };
-            }
-
-            if (prop === 'withFailureHandler') {
-              return function(fn) {
-                return createGasRunner(handlers.success, fn, handlers.userObject);
-              };
-            }
-
-            if (prop === 'withUserObject') {
-              return function(obj) {
-                return createGasRunner(handlers.success, handlers.failure, obj);
-              };
-            }
-
-            return function() {
-              const args = Array.prototype.slice.call(arguments);
-
-              gasBridgeCall(
-                String(prop),
-                args,
-                handlers.success,
-                handlers.failure,
-                handlers.userObject
-              );
-            };
-          }
-        });
       }
+    });
+  }
 
-      function makeGasRequestId() {
-        gasBridgeSequence += 1;
-        return 'chemquiz_' +
-          Date.now() + '_' +
-          gasBridgeSequence + '_' +
-          Math.random().toString(36).slice(2, 10);
+  function gasBridgeCall(method, args, success, failure, userObject) {
+    const request = {
+      type: 'gas-call',
+      id: 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+      method: method,
+      args: args
+    };
+
+    gasBridgePending[request.id] = {
+      success: success,
+      failure: failure,
+      userObject: userObject
+    };
+
+    if (!gasBridgeReady || !gasBridgeFrame || !gasBridgeFrame.contentWindow) {
+      gasBridgeQueue.push(request);
+      return;
+    }
+
+    sendGasRequest(request);
+  }
+
+  function sendGasRequest(request) {
+    try {
+      gasBridgeFrame.contentWindow.postMessage(request, '*');
+    } catch (err) {
+      const pending = gasBridgePending[request.id];
+      delete gasBridgePending[request.id];
+      if (pending && pending.failure) {
+        pending.failure(err, pending.userObject);
       }
+    }
+  }
 
-      function gasBridgeCall(method, args, success, failure, userObject) {
-        const request = {
-          type: 'gas-call',
-          id: makeGasRequestId(),
-          method: method,
-          args: Array.isArray(args) ? args : []
-        };
+  function flushGasBridgeQueue() {
+    while (gasBridgeQueue.length && gasBridgeReady) {
+      sendGasRequest(gasBridgeQueue.shift());
+    }
+  }
 
-        const pending = {
-          success: success,
-          failure: failure,
-          userObject: userObject
-        };
+  function initGasBridge() {
+    if (gasBridgeFrame) return;
 
-        /*
-         * IMPORTANT:
-         * Register the pending callback BEFORE postMessage().
-         * This prevents a very fast Bridge response from arriving before
-         * the callback has been stored.
-         */
-        gasBridgePending[request.id] = pending;
+    gasBridgeFrame = document.createElement('iframe');
+    gasBridgeFrame.id = 'gas-bridge-frame';
+    gasBridgeFrame.title = 'Google Apps Script Bridge';
+    gasBridgeFrame.setAttribute('aria-hidden', 'true');
+    gasBridgeFrame.style.position = 'fixed';
+    gasBridgeFrame.style.width = '1px';
+    gasBridgeFrame.style.height = '1px';
+    gasBridgeFrame.style.border = '0';
+    gasBridgeFrame.style.opacity = '0';
+    gasBridgeFrame.style.pointerEvents = 'none';
+    gasBridgeFrame.style.left = '-10px';
+    gasBridgeFrame.style.top = '-10px';
+    gasBridgeFrame.src = GAS_WEB_APP_URL;
+    document.body.appendChild(gasBridgeFrame);
+  }
 
-        if (!gasBridgeReady ||
-            !gasBridgeFrame ||
-            !gasBridgeFrame.contentWindow) {
-          gasBridgeQueue.push(request);
-          return;
-        }
+  window.addEventListener('message', function (event) {
+    if (!gasBridgeFrame || event.source !== gasBridgeFrame.contentWindow) return;
 
-        sendGasRequest(request);
+    const data = event.data || {};
+
+    if (data.type === 'gas-bridge-ready') {
+      gasBridgeReady = true;
+      flushGasBridgeQueue();
+      return;
+    }
+
+    if (data.type !== 'gas-result' || !data.id) return;
+
+    const pending = gasBridgePending[data.id];
+    if (!pending) return;
+
+    delete gasBridgePending[data.id];
+
+    if (data.ok) {
+      if (pending.success) pending.success(data.result, pending.userObject);
+    } else {
+      if (pending.failure) {
+        pending.failure(
+          new Error(data.error || 'Google Apps Script request failed.'),
+          pending.userObject
+        );
       }
+    }
+  });
 
-      function sendGasRequest(request) {
-        try {
-          gasBridgeFrame.contentWindow.postMessage(request, '*');
-        } catch (err) {
-          const pending = gasBridgePending[request.id];
+  window.google = window.google || {};
+  window.google.script = window.google.script || {};
+  window.google.script.run = createGasRunner();
 
-          delete gasBridgePending[request.id];
+  document.addEventListener('DOMContentLoaded', initGasBridge);
+})();
+</script>
 
-          if (pending && pending.failure) {
-            pending.failure(err, pending.userObject);
-          }
-        }
-      }
-
-      function flushGasBridgeQueue() {
-        if (!gasBridgeReady ||
-            !gasBridgeFrame ||
-            !gasBridgeFrame.contentWindow) {
-          return;
-        }
-
-        while (gasBridgeQueue.length > 0) {
-          sendGasRequest(gasBridgeQueue.shift());
-        }
-      }
-
-      function getBridgeUrl() {
-        /*
-         * GAS_WEB_APP_URL already contains ?page=bridge.
-         * Do not append another page=bridge parameter.
-         */
-        return GAS_WEB_APP_URL;
-      }
-
-      function initGasBridge() {
-        if (!GAS_WEB_APP_URL ||
-            GAS_WEB_APP_URL.indexOf('PASTE_YOUR_') === 0) {
-          console.error('Chem-Quiz: GAS_WEB_APP_URL is not configured.');
-          return;
-        }
-
-        if (gasBridgeFrame) return;
-
-        gasBridgeFrame = document.createElement('iframe');
-        gasBridgeFrame.id = 'gas-bridge-frame';
-        gasBridgeFrame.title = 'Google Apps Script Bridge';
-        gasBridgeFrame.setAttribute('aria-hidden', 'true');
-
-        gasBridgeFrame.style.position = 'fixed';
-        gasBridgeFrame.style.width = '1px';
-        gasBridgeFrame.style.height = '1px';
-        gasBridgeFrame.style.border = '0';
-        gasBridgeFrame.style.opacity = '0';
-        gasBridgeFrame.style.pointerEvents = 'none';
-        gasBridgeFrame.style.left = '-10px';
-        gasBridgeFrame.style.top = '-10px';
-
-        gasBridgeFrame.src = getBridgeUrl();
-
-        document.body.appendChild(gasBridgeFrame);
-      }
-
-      window.addEventListener('message', function(event) {
-        if (!gasBridgeFrame ||
-            event.source !== gasBridgeFrame.contentWindow) {
-          return;
-        }
-
-        const data = event.data || {};
-
-        if (data.type === 'gas-bridge-ready') {
-          gasBridgeReady = true;
-          flushGasBridgeQueue();
-          return;
-        }
-
-        if (data.type !== 'gas-result' || !data.id) {
-          return;
-        }
-
-        const pending = gasBridgePending[data.id];
-
-        if (!pending) return;
-
-        delete gasBridgePending[data.id];
-
-        if (data.ok) {
-          if (pending.success) {
-            pending.success(data.result, pending.userObject);
-          }
-        } else {
-          if (pending.failure) {
-            const error = new Error(
-              data.error || 'Google Apps Script request failed.'
-            );
-
-            pending.failure(error, pending.userObject);
-          }
-        }
-      });
-
-      /*
-       * Make google.script.run available BEFORE DOMContentLoaded.
-       * Calls made during startup are safely queued until Bridge.html
-       * reports gas-bridge-ready.
-       */
-      window.google = window.google || {};
-      window.google.script = window.google.script || {};
-      window.google.script.run = createGasRunner();
-
-      document.addEventListener('DOMContentLoaded', function() {
-        initGasBridge();
-      });
-    </script>
-<base target="_top">
+    <base target="_top">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, shrink-to-fit=no">
     <title>Chem-Quiz · MCQ</title>
-    <!-- InfinityFree student frontend using Apps Script Bridge.html -->
     
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -235,9 +161,25 @@
     <meta name="browsermode" content="application">
     <meta name="screen-orientation" content="portrait">
     
+    <link rel="manifest" href="data:application/json,{
+      &quot;name&quot;:&quot;Chem-Quiz&quot;,
+      &quot;short_name&quot;:&quot;Chem-Quiz&quot;,
+      &quot;start_url&quot;:&quot;.&quot;,
+      &quot;display&quot;:&quot;standalone&quot;,
+      &quot;background_color&quot;:&quot;#ffffff&quot;,
+      &quot;theme_color&quot;:&quot;#667eea&quot;,
+      &quot;orientation&quot;:&quot;portrait&quot;,
+      &quot;icons&quot;:[
+        {&quot;src&quot;:&quot;https://img.icons8.com/fluency/96/test-tube.png&quot;,&quot;sizes&quot;:&quot;96x96&quot;,&quot;type&quot;:&quot;image/png&quot;},
+        {&quot;src&quot;:&quot;https://img.icons8.com/fluency/192/test-tube.png&quot;,&quot;sizes&quot;:&quot;192x192&quot;,&quot;type&quot;:&quot;image/png&quot;},
+        {&quot;src&quot;:&quot;https://img.icons8.com/fluency/512/test-tube.png&quot;,&quot;sizes&quot;:&quot;512x512&quot;,&quot;type&quot;:&quot;image/png&quot;}
+      ]
+    }">
+    
+    <link rel="apple-touch-icon" href="https://img.icons8.com/fluency/192/test-tube.png">
+    
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      
       body {
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
         background: #f1f5f9;
@@ -252,120 +194,6 @@
         padding: 0;
         margin: 0;
       }
-      
-      /* ===== SPLASH SCREEN ===== */
-      #splash-screen {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 9999;
-        flex-direction: column;
-        transition: opacity 0.8s ease, transform 0.8s ease;
-      }
-      
-      #splash-screen.hidden {
-        opacity: 0;
-        transform: scale(1.1);
-        pointer-events: none;
-      }
-      
-      #splash-screen .splash-content {
-        text-align: center;
-        padding: 40px;
-        max-width: 400px;
-        width: 100%;
-      }
-      
-      #splash-screen .splash-logo {
-        font-size: 5rem;
-        display: block;
-        margin-bottom: 16px;
-        animation: pulse 2s ease-in-out infinite;
-      }
-      
-      #splash-screen .splash-logo img {
-        max-width: 150px;
-        max-height: 150px;
-        border-radius: 20px;
-        animation: pulse 2s ease-in-out infinite;
-      }
-      
-      #splash-screen h1 {
-        color: white;
-        font-size: 2.5rem;
-        font-weight: 900;
-        letter-spacing: -1px;
-        margin-bottom: 8px;
-      }
-      
-      #splash-screen h1 span {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-      }
-      
-      #splash-screen .splash-subtitle {
-        color: rgba(255,255,255,0.6);
-        font-weight: 600;
-        font-size: 1rem;
-        margin-bottom: 30px;
-      }
-      
-      #splash-screen .splash-btn {
-        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-        color: #1a1a2e;
-        border: none;
-        padding: 16px 48px;
-        border-radius: 50px;
-        font-size: 1.2rem;
-        font-weight: 900;
-        cursor: pointer;
-        transition: all 0.3s ease;
-        box-shadow: 0 8px 32px rgba(245, 158, 11, 0.3);
-        letter-spacing: 1px;
-        position: relative;
-        overflow: hidden;
-      }
-      
-      #splash-screen .splash-btn:hover {
-        transform: translateY(-3px) scale(1.02);
-        box-shadow: 0 12px 40px rgba(245, 158, 11, 0.4);
-      }
-      
-      #splash-screen .splash-btn:active {
-        transform: scale(0.95);
-      }
-      
-      #splash-screen .splash-btn .arrow {
-        display: inline-block;
-        transition: transform 0.3s ease;
-        margin-left: 8px;
-      }
-      
-      #splash-screen .splash-btn:hover .arrow {
-        transform: translateX(6px);
-      }
-      
-      #splash-screen .splash-credit {
-        color: rgba(255,255,255,0.3);
-        font-size: 0.8rem;
-        margin-top: 24px;
-        font-weight: 600;
-      }
-      
-      @keyframes pulse {
-        0%, 100% { transform: scale(1); }
-        50% { transform: scale(1.05); }
-      }
-      
-      /* ===== MAIN APP CONTAINER ===== */
       .container {
         max-width: 560px;
         width: 100%;
@@ -377,18 +205,30 @@
         scroll-behavior: smooth;
         position: relative;
         margin: 0 auto;
-        display: none;
       }
-      
-      .container.active {
-        display: block;
-      }
-      
-      .container.fullscreen {
-        max-width: 100%;
-        padding: 20px 24px;
-      }
-      
+      /* ===== WELCOME / SPLASH ===== */
+      #splash-screen{position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#111827 0%,#1e3a8a 52%,#4c1d95 100%);padding:24px;transition:opacity .45s ease,visibility .45s ease;}
+      #splash-screen.hidden{opacity:0;visibility:hidden;pointer-events:none;}
+      .splash-content{width:min(92vw,560px);text-align:center;color:#fff;padding:32px 24px;}
+      .splash-logo{width:150px;height:150px;margin:0 auto 22px;border-radius:28px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);box-shadow:0 18px 50px rgba(0,0,0,.25);overflow:hidden;}
+      .splash-logo img{width:100%;height:100%;object-fit:contain;padding:10px;}
+      .splash-fallback{font-size:4.5rem;}
+      .splash-content h1{font-size:clamp(2.2rem,7vw,4rem);font-weight:950;line-height:1.08;margin-bottom:10px;letter-spacing:-1.5px;}
+      .splash-content h1 span{background:linear-gradient(135deg,#fbbf24,#f9a8d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+      .splash-welcome{font-size:clamp(1.15rem,4vw,1.55rem);font-weight:800;margin-bottom:8px;}
+      .splash-subtitle{font-size:clamp(1rem,3vw,1.2rem);font-weight:600;color:rgba(255,255,255,.78);margin-bottom:30px;}
+      .splash-start-btn{width:min(100%,360px);padding:18px 28px;border:0;border-radius:18px;background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#111827;font-size:clamp(1.25rem,4vw,1.55rem);font-weight:950;cursor:pointer;box-shadow:0 12px 34px rgba(245,158,11,.32);letter-spacing:.4px;}
+      .splash-start-btn:active{transform:scale(.98);}
+      .splash-credit{margin-top:24px;font-size:.95rem;color:rgba(255,255,255,.58);font-weight:700;}
+      .app-corner-logo{position:absolute;top:10px;left:10px;z-index:2147483645;width:36px;height:36px;border-radius:10px;background:rgba(255,255,255,.96);border:1px solid #e2e8f0;box-shadow:0 4px 14px rgba(15,23,42,.12);display:flex;align-items:center;justify-content:center;overflow:hidden;}
+      .app-corner-logo img{width:100%;height:100%;object-fit:contain;padding:4px;}
+      .app-corner-logo .fallback{font-size:1.15rem;}
+      .contact-card{background:#fff;border-radius:18px;padding:24px;text-align:center;box-shadow:0 18px 50px rgba(15,23,42,.22);width:min(92vw,380px);border:1px solid #e2e8f0;}
+      .contact-card h2{font-size:1.5rem;font-weight:950;color:#0f172a;margin-bottom:16px;}
+      .contact-card .contact-line{font-size:1.05rem;font-weight:800;color:#334155;margin:10px 0;}
+      .contact-card .contact-phone{font-size:1.25rem;color:#667eea;font-weight:950;}
+      @media(max-width:560px){.splash-logo{width:118px;height:118px}.splash-content{padding:20px 10px}.splash-start-btn{padding:16px 22px}.app-corner-logo{width:32px;height:32px;top:7px;left:7px}}
+
       .header {
         text-align: center;
         margin-bottom: 16px;
@@ -398,15 +238,6 @@
         box-shadow: 0 2px 8px rgba(0,0,0,0.06);
         position: relative;
       }
-      
-      .header .app-logo {
-        max-width: 60px;
-        max-height: 60px;
-        border-radius: 12px;
-        margin-bottom: 4px;
-        display: inline-block;
-      }
-      
       .header .icon { font-size: 2.8rem; margin-bottom: 2px; display: block; }
       .header h1 { font-size: 1.8rem; font-weight: 900; color: #1a1a2e; letter-spacing: -0.5px; line-height: 1.2; }
       .header h1 span { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
@@ -437,7 +268,6 @@
         color: #667eea;
       }
       .header .header-fullscreen-btn:hover { background: #667eea; color: white; border-color: #667eea; }
-      
       .form-group { margin-bottom: 12px; }
       .form-group label { display: block; font-weight: 800; color: #333; margin-bottom: 4px; font-size: 0.9rem; letter-spacing: -0.3px; }
       .form-group label .required { color: #dc3545; }
@@ -460,7 +290,6 @@
         background: white;
         box-shadow: 0 0 0 4px rgba(102,126,234,0.15);
       }
-      
       .start-btn {
         width: 100%;
         padding: 14px;
@@ -478,7 +307,6 @@
       }
       .start-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(79,70,229,0.35); }
       .start-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-      
       .primary-btn {
         background: #059669;
         color: white;
@@ -493,7 +321,6 @@
       }
       .primary-btn:hover { background: #047857; transform: scale(1.02); }
       .primary-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-      
       .grid-btn {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -511,24 +338,8 @@
         justify-content: center;
         word-break: break-word;
         box-shadow: 0 2px 8px rgba(79,70,229,0.15);
-        position: relative;
       }
       .grid-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(79,70,229,0.25); }
-      
-      /* Flashcard badge on chapter button */
-      .grid-btn .flashcard-badge {
-        position: absolute;
-        top: -6px;
-        right: -6px;
-        background: #f59e0b;
-        color: white;
-        font-size: 0.6rem;
-        padding: 2px 6px;
-        border-radius: 10px;
-        font-weight: 700;
-        box-shadow: 0 2px 8px rgba(245, 158, 11, 0.4);
-      }
-      
       .back-btn {
         background: none;
         border: none;
@@ -541,7 +352,6 @@
         display: inline-block;
       }
       .back-btn:hover { text-decoration: underline; }
-      
       .option-btn {
         display: flex;
         align-items: center;
@@ -573,7 +383,6 @@
         flex-shrink: 0;
       }
       .option-btn.selected .letter { background: rgba(255,255,255,0.2); }
-      
       .question-nav-btn {
         width: 40px;
         height: 40px;
@@ -588,7 +397,6 @@
       .question-nav-btn:hover { background: #667eea; color: white; border-color: #667eea; }
       .question-nav-btn.answered { background: #059669; color: white; border-color: #059669; }
       .question-nav-btn.current { background: #667eea; color: white; border-color: #667eea; transform: scale(1.1); }
-      
       .error-message {
         background: #fee2e2;
         color: #991b1b;
@@ -601,19 +409,15 @@
         border: 1px solid #fecaca;
       }
       .error-message.show { display: block; animation: shake 0.3s ease; }
-      
       @keyframes shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
-      
       .view { display: none; animation: fadeIn 0.3s ease; }
       .view.active { display: block; }
-      
       .grid-container {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
         gap: 10px;
         margin-top: 12px;
       }
-      
       .question-box {
         background: #f8fafc;
         padding: 16px;
@@ -625,45 +429,13 @@
         border-left: 6px solid #667eea;
         color: #0f172a;
       }
-      
-      /* ===== QUESTION IMAGE CONTAINER ===== */
-      #question-image-container {
-        text-align: center;
-        margin: 8px 0;
-        padding: 0;
-        min-height: 0;
-      }
-      
-      #question-image-container img {
-        max-width: 100%;
-        max-height: 250px;
-        border-radius: 8px;
-        object-fit: contain;
-        border: 1px solid #e2e8f0;
-        background: white;
-        padding: 4px;
-      }
-      
-      #question-image-container .image-loading {
-        color: #94a3b8;
-        font-size: 0.85rem;
-        font-weight: 600;
-        padding: 8px;
-      }
-      
-      #question-image-container.hidden {
-        display: none;
-      }
-      
       #options-container {
         display: flex;
         flex-direction: column;
         gap: 8px;
         margin: 12px 0;
       }
-      
       .button-group { display: flex; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
-      
       .question-nav {
         display: flex;
         justify-content: center;
@@ -671,7 +443,6 @@
         flex-wrap: wrap;
         margin: 10px 0;
       }
-      
       .timer-bar {
         display: flex;
         align-items: center;
@@ -694,7 +465,6 @@
       }
       .timer-bar .timer-display.warning { color: #dc2626; animation: blink 0.5s ease infinite alternate; }
       @keyframes blink { from { opacity: 1; } to { opacity: 0.3; } }
-      
       .result-box {
         text-align: center;
         padding: 24px 20px;
@@ -713,7 +483,6 @@
       .result-stat .value.correct { color: #059669; }
       .result-stat .value.wrong { color: #dc2626; }
       .result-stat .value.skip { color: #f59e0b; }
-      
       .result-actions {
         display: flex;
         gap: 8px;
@@ -739,7 +508,6 @@
       .result-actions .retry-all:hover { background: #4338ca; }
       .result-actions .new-quiz { background: #059669; color: white; }
       .result-actions .new-quiz:hover { background: #047857; }
-      
       .loading { text-align: center; padding: 24px; color: #64748b; }
       .spinner {
         border: 4px solid #e2e8f0;
@@ -751,7 +519,6 @@
         margin: 0 auto 12px;
       }
       @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-      
       .stats-bar {
         display: flex;
         justify-content: center;
@@ -768,7 +535,6 @@
       .stats-bar .stat { text-align: center; }
       .stats-bar .stat .number { display: block; font-size: 1.3rem; font-weight: 900; color: #667eea; }
       .stats-bar .stat .label { font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
-      
       .footer {
         margin-top: 16px;
         padding-top: 12px;
@@ -785,7 +551,6 @@
       .footer .contact { text-align: right; font-size: 0.8rem; color: #888; font-weight: 600; }
       .footer .contact strong { color: #333; }
       .footer .contact .phone { color: #667eea; font-weight: 800; }
-      
       .welcome-banner {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -814,7 +579,6 @@
         transition: all 0.2s ease;
       }
       .welcome-banner .logout-btn:hover { background: rgba(255,255,255,0.3); }
-      
       .fullscreen-btn {
         background: rgba(255,255,255,0.2);
         color: white;
@@ -831,10 +595,8 @@
       }
       .fullscreen-btn:hover { background: rgba(255,255,255,0.3); }
       .fullscreen-btn .icon { font-size: 1rem; }
-      
       #question-progress { font-weight: 700; font-size: 0.9rem; color: #475569; margin-bottom: 4px; }
       #question-counter, #score-display { font-weight: 800; font-size: 0.9rem; }
-      
       .history-item {
         background: white;
         border-radius: 12px;
@@ -851,7 +613,6 @@
       .history-item .h-score { font-weight: 800; color: #667eea; background: #eef2ff; padding: 2px 12px; border-radius: 20px; font-size: 0.85rem; }
       .history-item .h-date { font-size: 0.7rem; color: #94a3b8; }
       .history-empty { text-align: center; padding: 30px 20px; color: #94a3b8; font-weight: 600; font-size: 0.95rem; }
-      
       .chapter-switcher {
         background: white;
         border-radius: 16px;
@@ -881,7 +642,6 @@
       }
       .chapter-switcher .chapter-grid button:hover { background: #667eea; color: white; border-color: #667eea; }
       .chapter-switcher .chapter-grid button.active-chapter { background: #667eea; color: white; border-color: #667eea; }
-      
       .history-stats {
         display: grid;
         grid-template-columns: 1fr 1fr 1fr;
@@ -897,7 +657,6 @@
       }
       .history-stats .stat-box .num { font-size: 1.3rem; font-weight: 900; color: #667eea; }
       .history-stats .stat-box .lbl { font-size: 0.65rem; color: #94a3b8; text-transform: uppercase; font-weight: 700; }
-      
       .history-filter {
         margin-bottom: 12px;
         display: flex;
@@ -916,96 +675,41 @@
       }
       .history-filter input:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.15); }
       .history-filter button { padding: 10px 18px; min-height: 40px; font-size: 0.85rem; }
-      
-      /* ===== LEADERBOARD - FIXED FOR MOBILE ===== */
       .leaderboard-box {
         background: white;
         border-radius: 16px;
-        padding: 12px;
+        padding: 16px;
         margin: 12px 0;
         border: 1px solid #e2e8f0;
         box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-        overflow: hidden;
       }
-      
-      .leaderboard-box h3 { 
-        font-size: 1rem; 
-        font-weight: 900; 
-        color: #0f172a; 
-        margin-bottom: 10px; 
-        display: flex; 
-        align-items: center; 
-        gap: 6px;
-      }
-      .leaderboard-box h3 .trophy { font-size: 1.1rem; }
-      
+      .leaderboard-box h3 { font-size: 1.1rem; font-weight: 900; color: #0f172a; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+      .leaderboard-box h3 .trophy { font-size: 1.3rem; }
       .leaderboard-item {
         display: flex;
         align-items: center;
-        padding: 8px 10px;
+        padding: 10px 12px;
         border-bottom: 1px solid #f1f5f9;
-        gap: 8px;
-        flex-wrap: nowrap;
+        gap: 10px;
       }
       .leaderboard-item:last-child { border-bottom: none; }
-      
-      .leaderboard-item .rank { 
-        font-size: 1rem; 
-        font-weight: 900; 
-        width: 30px; 
-        text-align: center; 
-        color: #94a3b8;
-        flex-shrink: 0;
-      }
+      .leaderboard-item .rank { font-size: 1.2rem; font-weight: 900; width: 36px; text-align: center; color: #94a3b8; }
       .leaderboard-item .rank.gold { color: #f59e0b; }
       .leaderboard-item .rank.silver { color: #94a3b8; }
       .leaderboard-item .rank.bronze { color: #d97706; }
-      
-      .leaderboard-item .info { 
-        flex: 1; 
-        min-width: 0;
-        overflow: hidden;
-      }
-      .leaderboard-item .info .name { 
-        font-weight: 700; 
-        color: #0f172a; 
-        font-size: 0.85rem;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .leaderboard-item .info .detail { 
-        font-size: 0.65rem; 
-        color: #94a3b8;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      
+      .leaderboard-item .info { flex: 1; }
+      .leaderboard-item .info .name { font-weight: 700; color: #0f172a; font-size: 0.95rem; }
+      .leaderboard-item .info .detail { font-size: 0.75rem; color: #94a3b8; }
       .leaderboard-item .score {
         font-weight: 800;
         color: #667eea;
-        font-size: 0.8rem;
+        font-size: 0.9rem;
         background: #eef2ff;
-        padding: 2px 10px;
+        padding: 2px 12px;
         border-radius: 20px;
-        white-space: nowrap;
-        flex-shrink: 0;
       }
-      
-      .leaderboard-empty { 
-        text-align: center; 
-        padding: 16px; 
-        color: #94a3b8; 
-        font-weight: 600; 
-        font-size: 0.85rem; 
-      }
-      .leaderboard-item.current-user { 
-        background: #eef2ff; 
-        border-radius: 8px; 
-        border-left: 4px solid #667eea; 
-      }
-      
+      .leaderboard-empty { text-align: center; padding: 20px; color: #94a3b8; font-weight: 600; font-size: 0.9rem; }
+      .leaderboard-item.current-user { background: #eef2ff; border-radius: 8px; border-left: 4px solid #667eea; }
       .leaderboard-refresh-btn {
         padding: 4px 12px;
         background: #eef2ff;
@@ -1014,46 +718,14 @@
         border-radius: 8px;
         cursor: pointer;
         font-weight: 700;
-        font-size: 0.65rem;
+        font-size: 0.7rem;
         transition: all 0.2s ease;
-        flex-shrink: 0;
       }
       .leaderboard-refresh-btn:hover { background: #667eea; color: white; }
-      
-      /* ===== HISTORY SCROLL FIX ===== */
-      #history-content {
-        max-height: 60vh;
-        overflow-y: auto;
-        padding-right: 8px;
-        scroll-behavior: smooth;
-        -webkit-overflow-scrolling: touch;
-      }
-      
-      #history-content::-webkit-scrollbar {
-        width: 5px;
-      }
-      #history-content::-webkit-scrollbar-track {
-        background: #f1f5f9;
-        border-radius: 10px;
-      }
-      #history-content::-webkit-scrollbar-thumb {
-        background: #667eea;
-        border-radius: 10px;
-      }
-      #history-content::-webkit-scrollbar-thumb:hover {
-        background: #4338ca;
-      }
-      
-      /* History auth section */
-      #history-auth {
-        background: white;
-        border-radius: 16px;
-        padding: 16px;
-        margin: 12px 0;
-        border: 1px solid #e2e8f0;
-      }
-      
-      /* Responsive */
+      .container.fullscreen { max-width: 100%; width:100%; min-height:100vh; padding: 20px 24px; background:#f1f5f9; overflow-y:auto; }
+      .container:fullscreen{width:100%;height:100%;min-height:100vh;max-width:none;border-radius:0;background:#f1f5f9;overflow-y:auto}
+      .container:-webkit-full-screen{width:100%;height:100%;min-height:100vh;max-width:none;border-radius:0;background:#f1f5f9;overflow-y:auto}
+
       @media (max-width:600px) {
         .container { padding: 12px 10px 20px; }
         .header { padding: 14px 12px; border-radius: 16px; }
@@ -1064,14 +736,13 @@
         .header .header-fullscreen-btn { top: 8px; right: 10px; padding: 4px 8px; font-size: 0.85rem; }
         .form-group label { font-size: 0.85rem; }
         .form-group input, .form-group select { font-size: 0.9rem; padding: 10px 12px; border-radius: 12px; }
-        .grid-btn { font-size: 0.85rem; padding: 10px 8px; min-height: 42px; border-radius: 12px; }
+        .grid-btn { font-size: 0.9rem; padding: 10px 8px; min-height: 42px; border-radius: 12px; }
         .grid-container { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; }
         .option-btn { font-size: 0.9rem; padding: 10px 12px; min-height: 46px; border-radius: 12px; }
         .option-btn .letter { width: 28px; height: 28px; line-height: 28px; font-size: 0.8rem; margin-right: 10px; }
         .start-btn { font-size: 1.05rem; padding: 12px; border-radius: 12px; }
         .primary-btn { font-size: 0.9rem; padding: 10px 18px; min-height: 40px; border-radius: 12px; }
         .question-box { font-size: 1rem; padding: 14px; border-radius: 12px; }
-        #question-image-container img { max-height: 180px; }
         .timer-bar .timer-display { font-size: 1.3rem; }
         .timer-bar .timer-label { font-size: 0.85rem; }
         .result-score { font-size: 2.8rem; }
@@ -1100,22 +771,11 @@
         .history-stats .stat-box .lbl { font-size: 0.6rem; }
         .history-filter input { font-size: 0.85rem; padding: 8px 12px; }
         .history-filter button { font-size: 0.8rem; padding: 8px 14px; min-height: 36px; }
-        
-        /* Leaderboard mobile */
-        .leaderboard-item { padding: 6px 8px; gap: 6px; }
-        .leaderboard-item .rank { font-size: 0.9rem; width: 24px; }
-        .leaderboard-item .info .name { font-size: 0.8rem; }
-        .leaderboard-item .score { font-size: 0.7rem; padding: 2px 8px; }
-        .leaderboard-box { padding: 10px; }
-        .leaderboard-box h3 { font-size: 0.9rem; }
-        
-        #history-content { max-height: 50vh; }
+        .leaderboard-item { padding: 8px 10px; }
+        .leaderboard-item .rank { font-size: 1rem; width: 28px; }
+        .leaderboard-item .info .name { font-size: 0.85rem; }
+        .leaderboard-item .score { font-size: 0.8rem; padding: 2px 10px; }
         .container.fullscreen { padding: 12px 14px; }
-        
-        #splash-screen .splash-logo { font-size: 3.5rem; }
-        #splash-screen .splash-logo img { max-width: 100px; max-height: 100px; }
-        #splash-screen h1 { font-size: 2rem; }
-        #splash-screen .splash-btn { padding: 14px 32px; font-size: 1rem; }
       }
 
       @media (max-width:380px) {
@@ -1136,134 +796,86 @@
         .primary-btn { font-size: 0.8rem; padding: 8px 14px; min-height: 34px; }
         .start-btn { font-size: 0.9rem; padding: 10px; }
         .question-box { font-size: 0.85rem; padding: 10px; }
-        #question-image-container img { max-height: 140px; }
         .result-actions button { font-size: 0.7rem; padding: 8px 10px; min-height: 32px; }
         .chapter-switcher .chapter-grid { grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); }
         .chapter-switcher .chapter-grid button { font-size: 0.65rem; padding: 4px 3px; min-height: 26px; }
         .history-stats { grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
         .history-stats .stat-box .num { font-size: 0.9rem; }
         .history-filter input { font-size: 0.8rem; padding: 6px 10px; }
-        
-        .leaderboard-item { padding: 4px 6px; gap: 4px; }
-        .leaderboard-item .rank { font-size: 0.8rem; width: 20px; }
-        .leaderboard-item .info .name { font-size: 0.75rem; }
-        .leaderboard-item .score { font-size: 0.65rem; padding: 2px 6px; }
-        .leaderboard-box { padding: 8px; }
-        .leaderboard-box h3 { font-size: 0.8rem; }
-        
-        #history-content { max-height: 40vh; }
+        .leaderboard-item { padding: 6px 8px; }
+        .leaderboard-item .rank { font-size: 0.9rem; width: 24px; }
+        .leaderboard-item .info .name { font-size: 0.8rem; }
+        .leaderboard-item .score { font-size: 0.7rem; padding: 2px 8px; }
         .container.fullscreen { padding: 6px 8px; }
-        
-        #splash-screen .splash-logo { font-size: 3rem; }
-        #splash-screen .splash-logo img { max-width: 80px; max-height: 80px; }
-        #splash-screen h1 { font-size: 1.6rem; }
-        #splash-screen .splash-btn { padding: 12px 24px; font-size: 0.9rem; }
       }
 
       @media all and (display-mode: standalone) {
         body { padding: 0 !important; margin: 0 !important; background: #f1f5f9; width: 100%; overflow-y: auto; }
         .container { border-radius: 0 !important; box-shadow: none !important; max-width: 100% !important; margin: 0 !important; padding: 14px 12px 24px !important; min-height: 100vh !important; border: none; background: #f1f5f9; overflow-y: visible; position: relative; }
       }
-    
-      /* ===== ANNOUNCEMENT TICKER ===== */
-      .announcement-ticker {
-        width: 100%;
-        margin: 10px 0 14px;
-        background: #fff;
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        overflow: hidden;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-        display: flex;
-        align-items: center;
-        min-height: 42px;
-      }
-      .announcement-ticker-label {
-        flex: 0 0 auto;
-        padding: 10px 12px;
-        background: #667eea;
-        color: #fff;
-        font-size: 0.78rem;
-        font-weight: 900;
-        z-index: 2;
-      }
-      .announcement-ticker-window {
-        flex: 1 1 auto;
-        overflow: hidden;
-        white-space: nowrap;
-        position: relative;
-      }
-      #announcementTickerTrack {
-        display: flex;
-        width: max-content;
-        will-change: transform;
-        animation: announcementTickerMove 80s linear infinite;
-      }
-      .ticker-segment {
-        display: flex;
-        flex: 0 0 auto;
-        align-items: center;
-      }
-      .announcement-ticker-item {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 10px 18px;
-        color: #334155;
-        font-size: 0.82rem;
-        font-weight: 700;
-      }
-      .ticker-title { color: #667eea; font-weight: 900; }
-      .ticker-separator { color: #94a3b8; padding: 0 4px; }
-      @keyframes announcementTickerMove {
-        from { transform: translateX(0); }
-        to { transform: translateX(-50%); }
-      }
 
+      .text-link-btn{border:none;background:none;color:#4f46e5;font-weight:800;cursor:pointer;padding:4px 8px;}
+      .auth-modal{position:fixed;inset:0;background:rgba(15,23,42,.65);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(4px);}
+      .auth-card{background:#fff;width:min(480px,100%);max-height:92vh;overflow:auto;border-radius:22px;padding:24px;box-shadow:0 25px 70px rgba(0,0,0,.3);position:relative;}
+      .auth-card h2{font-weight:900;color:#0f172a;margin-bottom:6px}.auth-note{color:#64748b;font-weight:600;font-size:.86rem;margin-bottom:16px}
+      .auth-close{position:absolute;right:14px;top:10px;border:0;background:none;font-size:1.3rem;cursor:pointer;color:#64748b}
+      .account-notice{background:#ecfdf5;border:2px solid #10b981;color:#065f46;border-radius:16px;padding:16px;margin-top:12px;font-weight:800}
+      .global-fullscreen-btn{position:fixed;top:10px;right:10px;z-index:2147483647;width:30px;height:30px;border:1px solid rgba(148,163,184,.35);border-radius:9px;background:rgba(15,23,42,.78);color:#fff;font-size:14px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 5px 16px rgba(15,23,42,.22);backdrop-filter:blur(6px)}
+      .global-fullscreen-btn:hover{background:rgba(15,23,42,.92);transform:scale(1.04)}
+      .guide-character{position:fixed;right:10px;bottom:12px;z-index:2147483646;width:92px;height:108px;pointer-events:none;filter:drop-shadow(0 7px 10px rgba(15,23,42,.18));animation:guideFloat 2.2s ease-in-out infinite;transform:translateZ(0)}
+      .announcement-ticker{position:relative;top:auto;z-index:2147483640;display:flex;align-items:center;gap:6px;width:100%;height:30px;margin:0 0 10px;padding:0 7px;background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;box-shadow:0 2px 7px rgba(15,23,42,.08);overflow:hidden}
+      .announcement-label{flex:0 0 auto;font-size:12px;font-weight:900;color:#9a3412;background:#ffedd5;border-radius:7px;padding:3px 5px}
+      .announcement-window{min-width:0;flex:1;overflow:hidden;white-space:nowrap}
+      .announcement-text{display:inline-block;min-width:100%;font-size:12px;line-height:20px;font-weight:800;color:#9a3412;white-space:nowrap;will-change:transform;animation:announcementMarquee 16s linear infinite}
+      @keyframes announcementMarquee{0%{transform:translateX(100%)}100%{transform:translateX(-100%)}}
+      @media (max-width:560px){.global-fullscreen-btn{top:7px;right:7px;width:28px;height:28px;font-size:13px}.announcement-ticker{height:28px;margin-bottom:8px;border-radius:8px;padding:0 5px}.announcement-label{font-size:11px;padding:2px 4px}.announcement-text{font-size:10.5px;animation-duration:13s}.guide-character{right:5px;bottom:6px;transform:scale(.82);transform-origin:bottom right}}
+      .guide-character .avatar-body{position:absolute;left:12px;bottom:0;width:68px;height:46px;border-radius:34px 34px 20px 20px;background:linear-gradient(145deg,#60a5fa,#4f46e5);border:3px solid #1e3a8a}
+      .guide-character .avatar-head{position:absolute;left:13px;top:4px;width:66px;height:66px;border-radius:50%;background:#ffd7b5;border:3px solid #7c3f20;z-index:2}
+      .guide-character .eye{position:absolute;top:24px;width:8px;height:10px;border-radius:50%;background:#172033}.guide-character .eye.left{left:17px}.guide-character .eye.right{right:17px}
+      .guide-character .brow{position:absolute;top:16px;width:15px;height:4px;border-radius:4px;background:#7c3f20}.guide-character .brow.left{left:13px}.guide-character .brow.right{right:13px}
+      .guide-character .mouth{position:absolute;left:23px;top:42px;width:20px;height:9px;border-bottom:3px solid #7c2630;border-radius:0 0 18px 18px}
+      .guide-character .arm{position:absolute;width:28px;height:10px;border-radius:10px;background:#ffd7b5;border:3px solid #7c3f20;z-index:3;transform-origin:right center;right:-1px;top:58px}
+      .guide-character .bubble{position:absolute;right:74px;top:-8px;background:#fff;border:2px solid #cbd5e1;border-radius:14px;padding:5px 8px;font-size:11px;font-weight:900;color:#334155;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.12)}
+      .guide-character.excited{animation:guideCelebrate .55s ease-in-out infinite}.guide-character.excited .brow.left{transform:rotate(-18deg)}.guide-character.excited .brow.right{transform:rotate(18deg)}.guide-character.excited .mouth{width:28px;height:18px;left:18px;border:3px solid #15803d;border-top:0;border-radius:0 0 18px 18px;background:#fff}.guide-character.excited .bubble{color:#15803d}
+      .guide-character.happy .brow.left{transform:rotate(-6deg)}.guide-character.happy .brow.right{transform:rotate(6deg)}.guide-character.happy .mouth{width:25px;height:14px;left:20px;border-bottom:4px solid #15803d}.guide-character.happy .bubble{color:#15803d}
+      .guide-character.worry .brow.left{transform:rotate(12deg)}.guide-character.worry .brow.right{transform:rotate(-12deg)}.guide-character.worry .mouth{top:44px;height:11px;border-bottom:0;border-top:3px solid #d97706;border-radius:50%}.guide-character.worry .bubble{color:#b45309}
+      .guide-character.anxious{animation:guideFloat 1.1s ease-in-out infinite}.guide-character.anxious .brow.left{transform:rotate(18deg)}.guide-character.anxious .brow.right{transform:rotate(-18deg)}.guide-character.anxious .mouth{top:43px;width:17px;height:13px;left:24px;border:3px solid #dc2626;border-bottom:0;border-radius:50%}.guide-character.anxious .bubble{color:#dc2626}
+      .guide-character.curious .brow.left{transform:rotate(12deg)}.guide-character.curious .brow.right{transform:rotate(-12deg)}.guide-character.curious .mouth{top:43px;height:13px;border-bottom:0;border-top:3px solid #7c2630;border-radius:50%}
+      .guide-character.think .arm{transform:rotate(-55deg);right:4px;top:47px}.guide-character.think .mouth{width:12px;height:12px;left:27px;border:3px solid #7c2630;border-radius:50%;background:#fff}
+      .guide-character.point .arm{transform:rotate(-18deg);right:-12px;top:54px}.guide-character.point{animation:guidePoint .75s ease-in-out infinite}
+      .guide-character.correct .mouth{width:25px;height:14px;left:20px;border-bottom:4px solid #15803d}.guide-character.correct .bubble{color:#15803d}
+      .guide-character.wrong .brow.left{transform:rotate(-15deg)}.guide-character.wrong .brow.right{transform:rotate(15deg)}.guide-character.wrong .mouth{top:45px;border-bottom:0;border-top:3px solid #dc2626;border-radius:50%}.guide-character.wrong .bubble{color:#dc2626}
+      .guide-character.celebrate{animation:guideCelebrate .65s ease-in-out infinite}.guide-character.celebrate .mouth{width:27px;height:17px;left:19px;border:3px solid #15803d;border-top:0;border-radius:0 0 18px 18px;background:#fff}.guide-character.celebrate .bubble{color:#15803d}
+      @keyframes guideFloat{50%{transform:translateY(-7px)}}@keyframes guidePoint{50%{transform:translateX(-8px) rotate(-5deg)}}@keyframes guideCelebrate{50%{transform:scale(1.08) rotate(5deg)}}
+      .question-image{display:block;max-width:100%;max-height:320px;margin:12px auto;border-radius:12px;border:1px solid #e2e8f0;object-fit:contain;background:#fff}
     </style>
   </head>
   <body>
-    
-    <!-- ===== SPLASH SCREEN ===== -->
     <div id="splash-screen">
       <div class="splash-content">
-        <span class="splash-logo" id="splashLogo">🧪</span>
-        <h1>Welcome to <span>Chem-Quiz</span></h1>
-        <div class="splash-subtitle">Master Chemistry with Interactive MCQs</div>
-        <button class="splash-btn" onclick="enterApp()">
-          Start Learning <span class="arrow">➜</span>
-        </button>
+        <div class="splash-logo" id="splash-logo"><span class="splash-fallback">🧪</span></div>
+        <div class="splash-welcome">Welcome to</div>
+        <h1><span>Chem-Quiz</span></h1>
+        <div class="splash-subtitle">Learn Chemistry • Practice MCQs • Improve Every Day</div>
+        <button class="splash-start-btn" onclick="enterApp()">🚀 Start Quiz</button>
         <div class="splash-credit">by Faizan Siddiqui</div>
       </div>
     </div>
-    
-    <!-- ===== MAIN APP ===== -->
+
     <div class="container" id="main-container">
-      
+      <div id="app-corner-logo" class="app-corner-logo"><span class="fallback">🧪</span></div>
+      <button id="global-fullscreen-btn" class="global-fullscreen-btn" onclick="toggleFullScreen()" title="Toggle Full Screen" aria-label="Toggle Full Screen">⛶</button>
+      <div id="guide-character" class="guide-character guide"><div class="avatar-head"><span class="brow left"></span><span class="brow right"></span><span class="eye left"></span><span class="eye right"></span><span class="mouth"></span></div><div class="avatar-body"></div><div class="arm"></div><div class="bubble">Let’s go!</div></div>
+      <div id="announcement-ticker" class="announcement-ticker" style="display:none;" aria-live="polite"><div class="announcement-label">📢</div><div class="announcement-window"><div id="announcement-text" class="announcement-text"></div></div></div>
+
       <!-- ===== LOGIN VIEW ===== -->
       <div id="login-view" class="login-view">
         <div class="header">
-          <button class="header-fullscreen-btn" onclick="toggleFullScreen()" title="Toggle Full Screen">⛶</button>
-          <span id="appLogoDisplay" class="icon">🧪</span>
+          <div class="icon">🧪</div>
           <h1>Welcome to <span>Chem-Quiz</span></h1>
           <div class="subtitle">by Faizan Siddiqui</div>
           <div class="quote">
             "Just like carbon under intense pressure, your greatest challenges are simply transforming you into something brilliant and indestructible."
-          </div>
-        </div>
-
-
-        <div class="announcement-ticker" id="announcementTicker" aria-label="Announcements">
-          <div class="announcement-ticker-label">📢 Announcements</div>
-          <div class="announcement-ticker-window">
-            <div id="announcementTickerTrack">
-              <div class="ticker-segment">
-                <span class="announcement-ticker-item">📢 Loading announcements...</span>
-              </div>
-              <div class="ticker-segment">
-                <span class="announcement-ticker-item">📢 Loading announcements...</span>
-              </div>
-            </div>
           </div>
         </div>
 
@@ -1283,12 +895,16 @@
           <button id="start-btn" class="start-btn" onclick="handleLogin()">
             🚀 Login & Start Quiz
           </button>
+          <div style="display:flex;justify-content:center;gap:18px;margin-top:12px;flex-wrap:wrap;">
+            <button type="button" class="text-link-btn" onclick="showSignup()">✨ Create Account</button>
+            <button type="button" class="text-link-btn" onclick="showForgotPassword()">🔑 Forgot Password?</button>
+          </div>
         </div>
 
         <div class="stats-bar">
           <div class="stat">
             <span class="number" id="total-questions">0</span>
-            <span class="label">Total Questions</span>
+            <span class="label">Questions</span>
           </div>
           <div class="stat">
             <span class="number" id="total-classes">6</span>
@@ -1303,12 +919,49 @@
         <div class="footer">
           <div class="footer-links">
             <a onclick="showFile()">📄 File</a>
-            <a onclick="showHistoryView()">📜 History</a>
-          </div>
+            </div>
           <div class="contact">
             <strong>Contact Us:</strong> Faizan Siddiqui<br>
             <span class="phone">📞 0300-3344355</span>
           </div>
+        </div>
+      </div>
+
+
+      <div id="signup-modal" class="auth-modal" style="display:none;">
+        <div class="auth-card">
+          <button class="auth-close" onclick="closeAuthModal('signup-modal')">✕</button>
+          <h2>✨ Create Student Account</h2>
+          <p class="auth-note">Your Student ID will be generated automatically. Save it when shown.</p>
+          <div class="form-group"><label>Student Name *</label><input id="signup-name" placeholder="Full name"></div>
+          <div class="form-group"><label>Gmail *</label><input id="signup-email" type="email" placeholder="name@gmail.com"></div>
+          <div class="form-group"><label>Phone / WhatsApp *</label><input id="signup-phone" placeholder="0300-1234567"></div>
+          <div class="form-group"><label>Password *</label><input id="signup-password" type="password" placeholder="Minimum 6 characters"></div>
+          <div class="form-group"><label>Re-enter Password *</label><input id="signup-confirm" type="password"></div>
+          <div id="signup-error" class="error-message"></div>
+          <button class="start-btn" onclick="submitSignup()">🎉 Create Account</button>
+        </div>
+      </div>
+      <div id="forgot-modal" class="auth-modal" style="display:none;">
+        <div class="auth-card">
+          <button class="auth-close" onclick="closeAuthModal('forgot-modal')">✕</button>
+          <h2>🔑 Recover Account</h2>
+          <p class="auth-note">Enter the Gmail and phone/WhatsApp number used during signup.</p>
+          <div class="form-group"><label>Gmail *</label><input id="forgot-email" type="email"></div>
+          <div class="form-group"><label>Phone / WhatsApp *</label><input id="forgot-phone"></div>
+          <div id="forgot-error" class="error-message"></div>
+          <button class="start-btn" onclick="submitForgotPassword()">🔐 Verify & Reset</button>
+          <div id="forgot-result" style="margin-top:12px;"></div>
+        </div>
+      </div>
+
+      <div id="contact-modal" class="auth-modal" style="display:none;z-index:99990;">
+        <div class="contact-card">
+          <button class="auth-close" onclick="closeAuthModal('contact-modal')">✕</button>
+          <h2>☎️ Contact Us</h2>
+          <div class="contact-line">Name : Faizan Siddiqui</div>
+          <div class="contact-line contact-phone">Contact : 0300-3344355</div>
+          <button class="primary-btn" style="width:100%;margin-top:16px;" onclick="closeAuthModal('contact-modal')">Close</button>
         </div>
       </div>
 
@@ -1320,18 +973,24 @@
             <div style="font-size:0.8rem;opacity:0.8;font-weight:700;" id="welcome-class">ID: - | Class: -</div>
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-            <button class="fullscreen-btn" onclick="toggleFullScreen()" title="Toggle Full Screen">
-              <span class="icon">⛶</span> Full Screen
-            </button>
             <button class="logout-btn" onclick="toggleFileMenu()" style="background:rgba(255,255,255,0.15);">📄</button>
-            <button class="logout-btn" onclick="showHistoryView()" style="background:rgba(255,255,255,0.15);">📜</button>
             <button class="logout-btn" onclick="handleLogout()">🚪 Logout</button>
           </div>
         </div>
 
         <div id="file-menu" class="chapter-switcher" style="display:none;">
-          <h3>📚 Switch Chapter</h3>
-          <div id="chapter-switcher-grid" class="chapter-grid"></div>
+          <h3>📄 File</h3>
+          <div class="chapter-grid">
+            <button onclick="changeClassFromFile()">🏫 Select Class</button>
+            <button onclick="changeChapterFromFile()">📚 Select Chapter</button>
+            <button onclick="showHistoryView()">📊 Result History</button>
+            <button onclick="showContactUs()">☎️ Contact Us</button>
+          </div>
+        </div>
+
+        <div id="class-selection-view" class="view hidden">
+          <h2 style="font-size:1.2rem;font-weight:900;color:#0f172a;">🏫 Select Your Class</h2>
+          <div id="student-class-list" class="grid-container"></div>
         </div>
 
         <div id="class-view" class="view active">
@@ -1362,7 +1021,6 @@
           </div>
           <div class="question-nav" id="question-nav"></div>
           <div id="question-text" class="question-box"></div>
-          <div id="question-image-container" class="hidden"></div>
           <div id="options-container"></div>
           <div class="button-group">
             <button id="submit-btn" onclick="submitAnswer()" class="primary-btn">Submit Answer</button>
@@ -1380,12 +1038,12 @@
           </div>
         </div>
 
-        <!-- ===== HISTORY VIEW - FIXED ===== -->
+        <!-- ===== UPDATED HISTORY VIEW ===== -->
         <div id="history-view" class="view hidden">
-          <h2 style="font-size:1.2rem;font-weight:900;color:#0f172a;">📜 Quiz History</h2>
+          <h2 style="font-size:1.3rem;font-weight:900;color:#0f172a;">📜 Quiz History</h2>
           <button class="back-btn" onclick="goBackFromHistory()">⬅ Back</button>
           
-          <div id="history-auth">
+          <div id="history-auth" style="display:none;background:white;border-radius:16px;padding:16px;margin:12px 0;border:1px solid #e2e8f0;">
             <p style="color:#475569;font-weight:700;margin-bottom:10px;">🔐 Enter Student ID and Password to view history:</p>
             
             <div class="form-group" style="margin-bottom:10px;">
@@ -1420,146 +1078,62 @@
 
     <script>
       // ============================================
-      // CHEM-QUIZ - Frontend JavaScript
+      // CHEM-QUIZ - Frontend JavaScript (Student ID + Password)
       // ============================================
 
-      // ========== SPLASH SCREEN FUNCTIONS ==========
-      function enterApp() {
-        var splash = document.getElementById('splash-screen');
-        splash.classList.add('hidden');
-        
-        document.getElementById('main-container').classList.add('active');
-        
-        setTimeout(function() {
-          var container = document.getElementById('main-container');
-          if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-            if (container.requestFullscreen) {
-              container.requestFullscreen();
-            } else if (container.webkitRequestFullscreen) {
-              container.webkitRequestFullscreen();
-            }
-            container.classList.add('fullscreen');
-          }
-        }, 500);
-        
-        loadAppLogo();
-        loadStats();
+      function setGuideState(kind){var g=document.getElementById('guide-character');if(!g)return;var bubble=g.querySelector('.bubble');g.className='guide-character '+(kind||'guide');var messages={guide:'Let’s go!',curious:'Hmm…?',point:'This way!',think:'Thinking…',correct:'Excellent!',wrong:'Keep going!',celebrate:'Amazing!',excited:'Amazing!',happy:'Well done!',worry:'You can do it!',anxious:'Oops… keep trying!'};if(bubble)bubble.textContent=messages[kind]||messages.guide;}
+
+      function setGuideScoreState(percentage){
+        var score=Number(percentage);
+        if(!isFinite(score)) score=0;
+        // Thresholds: >80 excited, 60–80 happy, 40–59 worry, <40 anxious.
+        if(score>80) setGuideState('excited');
+        else if(score>=60) setGuideState('happy');
+        else if(score>=40) setGuideState('worry');
+        else setGuideState('anxious');
       }
 
-      // ========== LOAD APP LOGO ==========
-      function loadAppLogo() {
-        if (!window.google || !google.script || !google.script.run) return;
-
-        google.script.run
-          .withSuccessHandler(function(logoData) {
-            if (logoData && logoData.dataUri) {
-              var splashLogo = document.getElementById('splashLogo');
-              if (splashLogo) {
-                splashLogo.innerHTML =
-                  '<img src="' + logoData.dataUri +
-                  '" style="max-width:150px;max-height:150px;border-radius:20px;">';
-              }
-
-              var appLogo = document.getElementById('appLogoDisplay');
-              if (appLogo) {
-                appLogo.innerHTML =
-                  '<img src="' + logoData.dataUri + '" class="app-logo">';
-              }
-            }
-          })
-          .withFailureHandler(function(error) {
-            console.warn('Logo could not be loaded:', error);
-          })
-          .getLogo();
+      function updateFullscreenButton(){
+        var btn=document.getElementById('global-fullscreen-btn');
+        if(!btn)return;
+        var active=!!(document.fullscreenElement||document.webkitFullscreenElement);
+        btn.textContent=active?'✕':'⛶';
+        btn.title=active?'Exit Full Screen':'Full Screen';
       }
 
-      // ========== ANNOUNCEMENT TICKER ==========
-      function escapeTickerHtml(value) {
-        return String(value == null ? '' : value)
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;')
-          .replace(/"/g, '&quot;')
-          .replace(/'/g, '&#39;');
-      }
-
-      function loadAnnouncementsTicker() {
-        var track = document.getElementById('announcementTickerTrack');
-        if (!track || !window.google || !google.script || !google.script.run) return;
-
-        google.script.run
-          .withSuccessHandler(function(announcements) {
-            if (announcements && announcements.error) {
-              track.innerHTML =
-                '<div class="ticker-segment"><span class="announcement-ticker-item">📢 Announcements unavailable right now.</span></div>';
-              return;
-            }
-
-            if (!Array.isArray(announcements) || announcements.length === 0) {
-              track.innerHTML =
-                '<div class="ticker-segment"><span class="announcement-ticker-item">📢 No new announcements at this time.</span></div>';
-              track.style.animation = 'none';
-              return;
-            }
-
-            var items = announcements.map(function(a) {
-              var title = escapeTickerHtml(a && a.title ? a.title : 'Announcement');
-              var message = escapeTickerHtml(a && a.message ? a.message : '');
-              return '<span class="announcement-ticker-item">' +
-                '<span class="ticker-title">' + title + '</span>' +
-                (message ? '<span class="ticker-separator">•</span>' + message : '') +
-                '<span class="ticker-separator">•</span>' +
-                '</span>';
-            }).join('');
-
-            var continuousContent =
-              '<div class="ticker-segment">' + items + '</div>' +
-              '<div class="ticker-segment">' + items + '</div>';
-
-            track.innerHTML = continuousContent;
-            track.style.animation = 'announcementTickerMove 80s linear infinite';
-          })
-          .withFailureHandler(function(error) {
-            console.warn('Announcements could not be loaded:', error);
-            track.innerHTML =
-              '<div class="ticker-segment"><span class="announcement-ticker-item">📢 Unable to load announcements.</span></div>';
-          })
-          .getActiveAnnouncements();
-      }
-
-      // ========== FULL SCREEN FUNCTIONS ==========
       function toggleFullScreen() {
         var container = document.getElementById('main-container');
         if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-          if (container.requestFullscreen) {
-            container.requestFullscreen();
-          } else if (container.webkitRequestFullscreen) {
-            container.webkitRequestFullscreen();
+          var req=container.requestFullscreen||container.webkitRequestFullscreen;
+          if(req){
+            try{ var promise=req.call(container); if(promise&&promise.catch)promise.catch(function(e){console.error('Fullscreen error:',e);}); }catch(e){console.error('Fullscreen error:',e);}
           }
-          container.classList.add('fullscreen');
         } else {
-          if (document.exitFullscreen) {
-            document.exitFullscreen();
-          } else if (document.webkitExitFullscreen) {
-            document.webkitExitFullscreen();
-          }
-          container.classList.remove('fullscreen');
+          if (document.exitFullscreen) document.exitFullscreen();
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
         }
       }
 
       document.addEventListener('fullscreenchange', function() {
         var container = document.getElementById('main-container');
-        if (!document.fullscreenElement) {
-          container.classList.remove('fullscreen');
-        }
+        if (document.fullscreenElement === container) container.classList.add('fullscreen');
+        else container.classList.remove('fullscreen');
+        updateFullscreenButton();
       });
       document.addEventListener('webkitfullscreenchange', function() {
         var container = document.getElementById('main-container');
-        if (!document.webkitFullscreenElement) {
-          container.classList.remove('fullscreen');
-        }
+        if (document.webkitFullscreenElement === container) container.classList.add('fullscreen');
+        else container.classList.remove('fullscreen');
+        updateFullscreenButton();
       });
 
+      document.addEventListener('click', function(){
+        if(state && state.sessionToken && !document.fullscreenElement && !document.webkitFullscreenElement){
+          setTimeout(requestAppFullscreen,0);
+        }
+      }, true);
+
+      // Press Enter key to login
       document.addEventListener('keydown', function(e) {
         if (e.key === 'Enter') {
           var loginView = document.getElementById('login-view');
@@ -1570,6 +1144,7 @@
       });
 
       var quizHistory = JSON.parse(localStorage.getItem('chemQuizHistory')) || [];
+      var STUDENT_SESSION_KEY = 'chemQuizStudentSessionV2';
 
       function saveToHistory(entry) {
         quizHistory.push(entry);
@@ -1600,10 +1175,69 @@
         allChapters: [],
         chapter: '',
         topic: '',
-        flashcardChapters: []
+        sessionToken: ''
       };
 
-      // ========== LOGIN FUNCTION ==========
+      function enterApp(){
+        var splash=document.getElementById('splash-screen');
+        if(splash) splash.classList.add('hidden');
+        var container=document.getElementById('main-container');
+        requestAppFullscreen();
+        loadAppLogo();
+        loadStats();
+        setTimeout(function(){
+          var input=document.getElementById('student-id');
+          if(input && document.getElementById('login-view').style.display!=='none') input.focus();
+        },350);
+      }
+
+      function requestAppFullscreen(){
+        var container=document.getElementById('main-container');
+        if(!container) return;
+        if(document.fullscreenElement||document.webkitFullscreenElement) return;
+        var req=container.requestFullscreen||container.webkitRequestFullscreen;
+        if(!req) return;
+        try{
+          var promise=req.call(container);
+          if(promise&&promise.catch) promise.catch(function(){});
+        }catch(e){}
+      }
+
+      function loadAppLogo(){
+        if(typeof google==='undefined'||!google.script) return;
+        google.script.run.withSuccessHandler(function(data){
+          if(!data||!data.dataUri)return;
+          var splash=document.getElementById('splash-logo');
+          if(splash)splash.innerHTML='<img src="'+data.dataUri+'" alt="Chem-Quiz Logo">';
+          var corner=document.getElementById('app-corner-logo');
+          if(corner)corner.innerHTML='<img src="'+data.dataUri+'" alt="Chem-Quiz Logo">';
+          var icon=document.querySelector('.header .icon');
+          if(icon)icon.innerHTML='<img src="'+data.dataUri+'" style="max-width:56px;max-height:56px;border-radius:10px;object-fit:contain;">';
+        }).withFailureHandler(function(){}).getLogo();
+      }
+
+      function showContactUs(){
+        document.getElementById('file-menu').style.display='none';
+        document.getElementById('contact-modal').style.display='flex';
+      }
+
+      function closeAuthModal(id){document.getElementById(id).style.display='none';}
+      function showSignup(){document.getElementById('signup-modal').style.display='flex';}
+      function showForgotPassword(){document.getElementById('forgot-modal').style.display='flex';}
+      function submitSignup(){
+        var n=document.getElementById('signup-name').value.trim(),e=document.getElementById('signup-email').value.trim(),p=document.getElementById('signup-phone').value.trim(),pw=document.getElementById('signup-password').value,cp=document.getElementById('signup-confirm').value,err=document.getElementById('signup-error');
+        err.className='error-message';
+        if(!n||!e||!p||!pw||!cp){err.textContent='⚠️ Please complete all fields.';err.className='error-message show';return;}
+        google.script.run.withSuccessHandler(function(r){if(r.success){err.className='error-message';document.querySelector('#signup-modal .auth-card').innerHTML='<button class="auth-close" onclick="closeAuthModal(\'signup-modal\')">✕</button><h2>🎉 Account Created!</h2><div class="account-notice">Your Student ID is<br><span style="font-size:1.45rem">'+r.studentId+'</span><br><br>⚠️ Save this Student ID. You will need it every time you log in.</div><button class="start-btn" style="margin-top:14px" onclick="useNewAccount(\''+r.studentId+'\',\''+pw.replace(/'/g,"\\'")+'\')">🚀 Continue to Login</button>';}else{err.textContent='❌ '+r.message;err.className='error-message show';}}).withFailureHandler(function(x){err.textContent='❌ '+x;err.className='error-message show';}).signupStudent(n,e,p,pw,cp);
+      }
+      function useNewAccount(id,pw){closeAuthModal('signup-modal');document.getElementById('student-id').value=id;document.getElementById('student-password').value=pw;document.getElementById('student-id').focus();}
+      function submitForgotPassword(){
+        var e=document.getElementById('forgot-email').value.trim(),p=document.getElementById('forgot-phone').value.trim(),err=document.getElementById('forgot-error'),out=document.getElementById('forgot-result');err.className='error-message';out.innerHTML='';
+        if(!e||!p){err.textContent='⚠️ Please enter Gmail and phone/WhatsApp.';err.className='error-message show';return;}
+        google.script.run.withSuccessHandler(function(r){if(r.success){out.innerHTML='<div class="account-notice">✅ Identity verified.<br><br>Student ID: <b>'+r.studentId+'</b><br>New Password: <b>'+r.password+'</b><br><br>⚠️ Save these credentials now. The password is shown here after reset.</div>';}else{err.textContent='❌ '+r.message;err.className='error-message show';}}).withFailureHandler(function(x){err.textContent='❌ '+x;err.className='error-message show';}).forgotStudentPassword(e,p);
+      }
+
+      // ========== LOGIN FUNCTION ========== 
       function handleLogin() {
         var studentId = document.getElementById('student-id').value.trim();
         var password = document.getElementById('student-password').value.trim();
@@ -1639,6 +1273,8 @@
               state.studentClass = result.student.class;
               state.studentEmail = result.student.email || '';
               state.studentWhatsApp = result.student.whatsapp || '';
+              state.sessionToken = result.token || '';
+              if (state.sessionToken) localStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify({token:state.sessionToken,student:result.student}));
               
               console.log("✅ Login successful!");
               console.log("Student:", state.studentId, state.studentName);
@@ -1646,12 +1282,13 @@
               
               document.getElementById('login-view').style.display = 'none';
               document.getElementById('quiz-views').style.display = 'block';
+              requestAppFullscreen();
+              loadAppLogo();
               
               document.getElementById('welcome-user').textContent = '👋 Welcome, ' + state.studentName + '!';
               document.getElementById('welcome-class').textContent = 'ID: ' + state.studentId + ' | Class: ' + state.studentClass;
               
               loadChapters(state.studentClass);
-              loadFlashcardChapters();
             } else {
               errorDiv.textContent = '❌ ' + result.message;
               errorDiv.className = 'error-message show';
@@ -1668,76 +1305,26 @@
           .loginStudent(studentId, password);
       }
 
-      // ========== LOAD FLASHCARD CHAPTERS ==========
-      function loadFlashcardChapters() {
-        google.script.run
-          .withSuccessHandler(function(chapters) {
-            state.flashcardChapters = chapters || [];
-          })
-          .withFailureHandler(function() {})
-          .getFlashcardChapters(state.studentClass);
-      }
-
-      // ========== DISPLAY QUESTION IMAGE ==========
-      function displayQuestionImage(imageUrl) {
-        var container = document.getElementById('question-image-container');
-        container.innerHTML = '';
-        
-        if (!imageUrl || imageUrl === '' || imageUrl === 'undefined' || imageUrl === 'null') {
-          container.classList.add('hidden');
-          return;
-        }
-        
-        container.classList.remove('hidden');
-        
-        if (imageUrl.startsWith('data:image')) {
-          container.innerHTML = '<img src="' + imageUrl + '" alt="Question Image">';
-          return;
-        }
-        
-        container.innerHTML = '<div class="image-loading">🔄 Loading image...</div>';
-        
-        google.script.run
-          .withSuccessHandler(function(dataUri) {
-            if (dataUri && dataUri !== 'null' && dataUri !== '') {
-              container.innerHTML = '<img src="' + dataUri + '" alt="Question Image">';
-            } else {
-              container.innerHTML = '';
-              container.classList.add('hidden');
-            }
-          })
-          .withFailureHandler(function() {
-            container.innerHTML = '';
-            container.classList.add('hidden');
-          })
-          .getImageDataUri(imageUrl);
-      }
-
-      // ========== OTHER FUNCTIONS ==========
-      
       function handleLogout() {
         stopTimer();
-        document.getElementById('login-view').style.display = 'block';
-        document.getElementById('quiz-views').style.display = 'none';
-        document.getElementById('student-id').value = '';
-        document.getElementById('student-password').value = '';
-        document.getElementById('file-menu').style.display = 'none';
-        document.querySelectorAll('#quiz-views .view').forEach(function(el) {
-          el.classList.remove('active');
-        });
+        var token=state.sessionToken;
+        if(token){ google.script.run.withFailureHandler(function(){}).logoutStudent(token); }
+        localStorage.removeItem(STUDENT_SESSION_KEY);
+        state.sessionToken='';
+        document.getElementById('login-view').style.display='block';
+        document.getElementById('quiz-views').style.display='none';
+        document.getElementById('student-id').value='';
+        document.getElementById('student-password').value='';
+        document.getElementById('file-menu').style.display='none';
+        document.querySelectorAll('#quiz-views .view').forEach(function(el){el.classList.remove('active');});
         document.getElementById('class-view').classList.add('active');
-        if (document.fullscreenElement || document.webkitFullscreenElement) {
-          if (document.exitFullscreen) document.exitFullscreen();
-          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-          document.getElementById('main-container').classList.remove('fullscreen');
-        }
+        if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen();
       }
 
       function toggleFileMenu() {
         var menu = document.getElementById('file-menu');
         if (menu.style.display === 'none' || menu.style.display === '') {
           menu.style.display = 'block';
-          renderChapterSwitcher();
         } else {
           menu.style.display = 'none';
         }
@@ -1779,19 +1366,36 @@
         });
       }
 
+      function changeClassFromFile(){
+        document.getElementById('file-menu').style.display='none';
+        stopTimer();
+        loadClassSelection();
+      }
+      function changeChapterFromFile(){
+        document.getElementById('file-menu').style.display='none';
+        stopTimer();
+        loadChapters(state.studentClass);
+      }
+      function loadClassSelection(){
+        setGuideState('curious');
+        showView('class-selection-view'); showLoading('student-class-list');
+        google.script.run.withSuccessHandler(function(classes){
+          var c=document.getElementById('student-class-list'); c.innerHTML='';
+          (classes||[]).forEach(function(cls){var b=document.createElement('button');b.className='grid-btn';b.textContent=cls;b.onclick=function(){state.studentClass=cls;document.getElementById('welcome-class').textContent='ID: '+state.studentId+' | Class: '+state.studentClass;loadChapters(cls);};c.appendChild(b);});
+        }).withFailureHandler(function(e){document.getElementById('student-class-list').innerHTML='<p class="error-message show">❌ '+e+'</p>';}).getAllClasses();
+      }
+
+      // ========== UPDATED HISTORY FUNCTIONS (WITH ID + PASSWORD) ========== 
+
       function showHistoryView() {
         state.previousView = document.querySelector('#quiz-views .view.active')?.id || 'class-view';
         document.getElementById('file-menu').style.display = 'none';
         showView('history-view');
         
-        document.getElementById('history-student-id').value = '';
-        document.getElementById('history-password').value = '';
-        document.getElementById('history-auth-error').style.display = 'none';
-        
-        var container = document.getElementById('history-content');
-        container.innerHTML = `
-          <div class="history-empty">Enter Student ID and Password, then click "View History" to see quiz history.</div>
-        `;
+        document.getElementById('history-auth').style.display='none';
+        var container=document.getElementById('history-content');
+        container.innerHTML='<div class="loading"><div class="spinner"></div><p>Loading your result history...</p></div>';
+        google.script.run.withSuccessHandler(function(result){if(result.success){container.innerHTML='<div style="background:#eef2ff;border-radius:12px;padding:12px 16px;margin-bottom:12px;font-weight:800;">👤 '+result.student.name+'<br><span style="font-size:.82rem;color:#475569">ID: '+result.student.id+' | Class: '+result.student.class+'</span></div>';renderMyHistory(result.history||[]);}else{container.innerHTML='<div class="history-empty">❌ '+result.message+'</div>';}}).withFailureHandler(function(e){container.innerHTML='<div class="history-empty">❌ '+e+'</div>';}).getStudentHistoryBySession(state.sessionToken);
       }
 
       function getErrorMessage(error) {
@@ -1801,71 +1405,13 @@
         try { return JSON.stringify(error); } catch (e) { return String(error); }
       }
 
-      function loadMyHistory() {
-        var studentId = document.getElementById('history-student-id').value.trim();
-        var password = document.getElementById('history-password').value.trim();
-        var errorDiv = document.getElementById('history-auth-error');
-        var container = document.getElementById('history-content');
-        
-        errorDiv.style.display = 'none';
-        
-        if (!studentId) {
-          errorDiv.textContent = '⚠️ Please enter your Student ID.';
-          errorDiv.style.display = 'block';
-          return;
-        }
-        
-        if (!password || password.length < 4) {
-          errorDiv.textContent = '⚠️ Please enter your password (minimum 4 characters).';
-          errorDiv.style.display = 'block';
-          return;
-        }
-        
-        container.innerHTML = `<div class="loading"><div class="spinner"></div><p>Verifying credentials and loading history...</p></div>`;
-        
-        google.script.run
-          .withSuccessHandler(function(result) {
-            if (result.success) {
-              var studentInfo = result.student;
-              var headerHtml = `
-                <div style="background:#eef2ff;border-radius:12px;padding:12px 16px;margin-bottom:12px;border-left:4px solid #667eea;">
-                  <div style="font-weight:800;color:#0f172a;">👤 ${studentInfo.name}</div>
-                  <div style="font-size:0.85rem;color:#475569;">ID: ${studentInfo.id} | Class: ${studentInfo.class}</div>
-                </div>
-              `;
-              container.innerHTML = headerHtml;
-              renderMyHistory(result.history || []);
-            } else {
-              errorDiv.textContent = '❌ ' + result.message;
-              errorDiv.style.display = 'block';
-              container.innerHTML = `
-                <div class="history-empty">
-                  ❌ ${result.message}
-                  <br><br>
-                  <button onclick="showHistoryView()" style="padding:8px 16px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:700;">
-                    🔄 Try Again
-                  </button>
-                </div>
-              `;
-            }
-          })
-          .withFailureHandler(function(error) {
-            container.innerHTML = `
-              <div class="history-empty">
-                ❌ Error: ${error}
-                <br><br>
-                <button onclick="showHistoryView()" style="padding:8px 16px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:700;">
-                  🔄 Try Again
-                </button>
-              </div>
-            `;
-          })
-          .getStudentHistory(studentId, password);
-      }
+      function loadMyHistory(){ showHistoryView(); }
 
       function renderMyHistory(historyData) {
         var container = document.getElementById('history-content');
         if (!container) return;
+        
+        console.log("📊 Rendering history with", historyData ? historyData.length : 0, "entries");
         
         if (!historyData || historyData.length === 0) {
           container.innerHTML += `
@@ -1902,6 +1448,7 @@
               <div class="lbl">🏆 Best Score</div>
             </div>
           </div>
+          <div style="max-height:400px;overflow-y:auto;">
         `;
         
         historyData.forEach(function(entry) {
@@ -1930,18 +1477,31 @@
           `;
         });
         
+        html += `</div>`;
         container.innerHTML += html;
+        console.log("✅ History rendered successfully");
       }
 
       function goBackFromHistory() {
         showView(state.previousView);
       }
 
+      // ========== LEADERBOARD FUNCTIONS ==========
+
       function loadLeaderboard() {
         var container = document.getElementById('leaderboard-container');
-        if (!container) return;
+        if (!container) {
+          console.error("❌ Leaderboard container not found!");
+          return;
+        }
+        
+        console.log("📊 LOADING LEADERBOARD");
+        console.log("📊 Class:", state.studentClass);
+        console.log("📊 Chapter:", state.chapter);
+        console.log("📊 Topic:", state.topic);
         
         if (!state.studentClass || !state.chapter || !state.topic) {
+          console.log("⚠️ Missing data for leaderboard");
           container.innerHTML = `
             <div class="leaderboard-box">
               <h3><span class="trophy">🏆</span> Leaderboard</h3>
@@ -1958,9 +1518,15 @@
         
         google.script.run
           .withSuccessHandler(function(data) {
+            console.log("✅ LEADERBOARD DATA RECEIVED:", data);
+            console.log("✅ Data type:", typeof data);
+            console.log("✅ Is array:", Array.isArray(data));
+            console.log("✅ Data length:", data ? data.length : 0);
+            
             if (data && Array.isArray(data) && data.length > 0) {
               renderLeaderboard(data);
             } else {
+              console.log("⚠️ No leaderboard data found");
               container.innerHTML = `
                 <div class="leaderboard-box">
                   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
@@ -1976,6 +1542,7 @@
             }
           })
           .withFailureHandler(function(error) {
+            console.error("❌ Error loading leaderboard:", error);
             container.innerHTML = `
               <div class="leaderboard-box">
                 <h3><span class="trophy">🏆</span> Leaderboard</h3>
@@ -1996,13 +1563,16 @@
         var container = document.getElementById('leaderboard-container');
         if (!container) return;
         
+        console.log("📊 Rendering leaderboard with", data.length, "entries");
+        console.log("📊 Data:", JSON.stringify(data));
+        
         var medals = ['🥇', '🥈', '🥉'];
         var rankClasses = ['gold', 'silver', 'bronze'];
         
         var html = `
           <div class="leaderboard-box">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-              <h3><span class="trophy">🏆</span> Top ${Math.min(5, data.length)}</h3>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <h3 style="margin:0;"><span class="trophy">🏆</span> Top ${Math.min(5, data.length)}</h3>
               <button onclick="loadLeaderboard()" class="leaderboard-refresh-btn">🔄 Refresh</button>
             </div>
         `;
@@ -2028,50 +1598,52 @@
         
         html += `</div>`;
         container.innerHTML = html;
+        console.log("✅ Leaderboard rendered successfully");
       }
+
+      // ========== OTHER FUNCTIONS ==========
 
       function showFile() {
         toggleFileMenu();
       }
 
-      function loadStats(attempt) {
-        attempt = attempt || 0;
-
-        var totalEl = document.getElementById('total-questions');
-        var chaptersEl = document.getElementById('total-chapters');
-
-        if (!totalEl || !chaptersEl) return;
-
-        // Keep the stats visible while the Apps Script bridge connects.
-        if (attempt === 0) {
-          totalEl.textContent = '…';
-          chaptersEl.textContent = '…';
-        }
-
-        if (typeof google === 'undefined' || !google.script || !google.script.run) {
-          if (attempt < 10) {
-            setTimeout(function() { loadStats(attempt + 1); }, 500);
-          } else {
-            totalEl.textContent = '--';
-            chaptersEl.textContent = '--';
-          }
-          return;
-        }
-
+      function loadAnnouncement() {
+        if (typeof google === 'undefined' || !google.script) return;
         google.script.run
           .withSuccessHandler(function(data) {
-            data = data || {};
-            totalEl.textContent = Number(data.total) || 0;
-            chaptersEl.textContent = Number(data.chapters) || 0;
-          })
-          .withFailureHandler(function(error) {
-            console.error('Chem-Quiz: getStats failed:', error);
-            if (attempt < 10) {
-              setTimeout(function() { loadStats(attempt + 1); }, 700);
+            var ticker = document.getElementById('announcement-ticker');
+            var text = document.getElementById('announcement-text');
+            if (!ticker || !text) return;
+            if (data && data.message) {
+              text.textContent = data.message;
+              ticker.style.display = 'flex';
+              text.style.animation = 'none';
+              void text.offsetWidth;
+              text.style.animation = '';
             } else {
-              totalEl.textContent = '--';
-              chaptersEl.textContent = '--';
+              ticker.style.display = 'none';
             }
+          })
+          .withFailureHandler(function() {})
+          .getActiveAnnouncement();
+      }
+
+      function startAnnouncementRefresh(){
+        loadAnnouncement();
+        if(window.__announcementTimer) clearInterval(window.__announcementTimer);
+        window.__announcementTimer=setInterval(loadAnnouncement,30000);
+      }
+
+      function loadStats() {
+        if (typeof google === 'undefined' || !google.script) return;
+        google.script.run
+          .withSuccessHandler(function(data) {
+            document.getElementById('total-questions').textContent = data.total || 0;
+            document.getElementById('total-chapters').textContent = data.chapters || 0;
+          })
+          .withFailureHandler(function() {
+            document.getElementById('total-questions').textContent = '--';
+            document.getElementById('total-chapters').textContent = '--';
           })
           .getStats();
       }
@@ -2098,6 +1670,10 @@
 
       function loadChapters(classLevel) {
         showLoading('chapter-list');
+        if (typeof google === 'undefined' || !google.script) {
+          document.getElementById('chapter-list').innerHTML = `<p style="color:#dc2626;text-align:center;padding:20px;font-weight:600;">❌ Google Apps Script not available</p>`;
+          return;
+        }
         google.script.run
           .withSuccessHandler(function(chapters) {
             state.chapters = chapters;
@@ -2111,28 +1687,18 @@
           .getChapters(classLevel);
       }
 
-      // ========== RENDER CHAPTERS WITH FLASHCARD BADGE ==========
       function renderChapters(chapters) {
+        setGuideState('point');
         var container = document.getElementById('chapter-list');
         container.innerHTML = '';
         if (chapters.length === 0) {
           container.innerHTML = `<p style="color:#64748b;text-align:center;padding:20px;font-weight:600;font-size:0.9rem;">📚 No chapters available for your class yet.</p>`;
           return;
         }
-        
         chapters.forEach(function(chapter) {
           var btn = document.createElement('button');
           btn.className = 'grid-btn';
           btn.textContent = chapter;
-          
-          // Check if this chapter has flashcards
-          if (state.flashcardChapters && state.flashcardChapters.includes(chapter)) {
-            var badge = document.createElement('span');
-            badge.className = 'flashcard-badge';
-            badge.textContent = '🎴';
-            btn.appendChild(badge);
-          }
-          
           btn.onclick = function() { 
             state.chapter = chapter;
             loadTopics(state.studentClass, chapter); 
@@ -2159,6 +1725,7 @@
       }
 
       function renderTopics(topics) {
+        setGuideState('curious');
         var container = document.getElementById('topic-list');
         container.innerHTML = '';
         if (topics.length === 0) {
@@ -2179,23 +1746,19 @@
       }
 
       function loadQuestionCount(classLevel, chapter, topic) {
+        setGuideState('think');
         state.topic = topic;
         document.getElementById('topic-title').textContent = '🔢 ' + topic + ' - How many questions?';
-        var counts = [5, 10, 15, 20];
+        var counts = [10, 20, 30, 50];
         var container = document.getElementById('count-list');
         container.innerHTML = '';
         counts.forEach(function(count) {
           var btn = document.createElement('button');
           btn.className = 'grid-btn';
-          btn.textContent = count + ' questions';
+          btn.textContent = '📝 ' + count + ' MCQs';
           btn.onclick = function() { startQuiz(classLevel, chapter, topic, count); };
           container.appendChild(btn);
         });
-        var allBtn = document.createElement('button');
-        allBtn.className = 'grid-btn';
-        allBtn.textContent = '📚 All Questions';
-        allBtn.onclick = function() { startQuiz(classLevel, chapter, topic, 0); };
-        container.appendChild(allBtn);
         showView('count-view');
       }
 
@@ -2230,6 +1793,7 @@
       }
 
       function startTimer() {
+        setGuideState('think');
         if (state.timerInterval) clearInterval(state.timerInterval);
         state.timer = 60;
         updateTimerDisplay();
@@ -2327,11 +1891,14 @@
           .withSuccessHandler(function(result) {
             console.log("✅ Quiz results saved:", result);
             showResults();
+            // The server callback runs after saveQuizResults() finishes,
+            // so the new score is already available to getLeaderboard().
             loadLeaderboard();
           })
           .withFailureHandler(function(error) {
             console.error("❌ Error saving quiz results:", error);
             showResults();
+            // Still show the current leaderboard if saving failed.
             loadLeaderboard();
           })
           .saveQuizResults(
@@ -2344,11 +1911,13 @@
             state.totalQuestions,
             state.attempted,
             email,
-            whatsapp
+            whatsapp,
+            state.sessionToken
           );
       }
 
       function renderQuestion(index) {
+        setGuideState('point');
         var questions = state.questions;
         if (!questions || questions.length === 0) {
           document.getElementById('question-text').textContent = 'No questions available.';
@@ -2360,14 +1929,8 @@
 
         document.getElementById('question-progress').textContent = 'Question ' + (index + 1) + ' of ' + questions.length;
         document.getElementById('question-text').textContent = q.text;
-        
-        if (q.imageUrl && q.imageUrl !== '' && q.imageUrl !== 'undefined' && q.imageUrl !== 'null') {
-          displayQuestionImage(q.imageUrl);
-        } else {
-          var container = document.getElementById('question-image-container');
-          container.innerHTML = '';
-          container.classList.add('hidden');
-        }
+        var oldImg=document.getElementById('question-image'); if(oldImg) oldImg.remove();
+        if(q.imageUrl){var img=document.createElement('img');img.id='question-image';img.className='question-image';img.src=q.imageUrl;img.alt='Question illustration';img.loading='eager';img.onerror=function(){this.style.display='none';var note=document.createElement('div');note.id='question-image-error';note.style='color:#b45309;text-align:center;font-weight:800;margin:8px 0';note.textContent='⚠️ Question image could not be displayed.';this.parentNode.insertBefore(note,this.nextSibling);};var qb=document.getElementById('question-text');qb.parentNode.insertBefore(img,qb.nextSibling);}
 
         var container = document.getElementById('options-container');
         container.innerHTML = '';
@@ -2462,9 +2025,11 @@
           .withSuccessHandler(function(result) {
             state.attempted++;
             if (result.isCorrect) {
+              setGuideState('correct');
               state.score++;
               state.answerResults[index] = 'correct';
             } else {
+              setGuideState('wrong');
               state.answerResults[index] = 'wrong';
               state.correctAnswers[index] = result.correctAnswer;
             }
@@ -2487,7 +2052,7 @@
                 submitResultsAndShow();
               }
             } else {
-              renderQuestion(nextIndex);
+              setTimeout(function(){ renderQuestion(nextIndex); }, 650);
             }
           })
           .withFailureHandler(function(error) {
@@ -2504,6 +2069,7 @@
         var wrong = state.attempted - correct;
         var skip = total - state.attempted;
         var percentage = total > 0 ? Math.round((correct / total) * 100) : 0;
+        setGuideScoreState(percentage);
 
         var container = document.getElementById('results-content');
 
@@ -2602,27 +2168,37 @@
         loadChapters(state.studentClass);
       }
 
+      function restoreStudentSession(){
+        var saved=null; try{saved=JSON.parse(localStorage.getItem(STUDENT_SESSION_KEY)||'null');}catch(e){}
+        if(!saved||!saved.token)return;
+        google.script.run.withSuccessHandler(function(r){
+          if(!r||!r.success){localStorage.removeItem(STUDENT_SESSION_KEY);return;}
+          state.sessionToken=saved.token; state.studentId=r.student.id; state.studentName=r.student.name; state.studentClass=r.student.class; state.studentEmail=r.student.email||''; state.studentWhatsApp=r.student.whatsapp||'';
+          document.getElementById('login-view').style.display='none';document.getElementById('quiz-views').style.display='block';
+          requestAppFullscreen(); loadAppLogo();
+          document.getElementById('welcome-user').textContent='👋 Welcome, '+state.studentName+'!';document.getElementById('welcome-class').textContent='ID: '+state.studentId+' | Class: '+state.studentClass;
+          loadClassSelection();
+        }).withFailureHandler(function(){localStorage.removeItem(STUDENT_SESSION_KEY);}).getStudentSession(saved.token);
+      }
       // ========== INITIALIZATION ==========
-
-      // If the bridge never becomes ready, show a useful console diagnostic.
-      setTimeout(function() {
-        if (typeof gasBridgeReady !== 'undefined' && !gasBridgeReady) {
-          console.error(
-            'Chem-Quiz: Apps Script bridge is not ready. ' +
-            'Check the Bridge.html deployment and /exec?page=bridge URL.'
-          );
-        }
-      }, 12000);
-
       document.addEventListener('DOMContentLoaded', function() {
-        // InfinityFree bridge is initialized independently and queues these calls
-        // until the hidden Apps Script Bridge.html is ready.
-        loadAppLogo();
-        loadAnnouncementsTicker();
-        loadStats();
+        if (typeof google === 'undefined' || !google.script) {
+          document.body.innerHTML = `
+            <div style="text-align:center;padding:40px;color:#991b1b;background:#fee2e2;border-radius:12px;max-width:500px;margin:40px auto;">
+              <h3>⚠️ Configuration Error</h3>
+              <p>This app needs to be deployed as a Google Apps Script Web App.</p>
+            </div>
+          `;
+          return;
+        }
 
-        document.getElementById('splash-screen').style.display = 'flex';
-        document.getElementById('main-container').classList.remove('active');
+        loadAppLogo();
+        loadStats();
+        startAnnouncementRefresh();
+        document.getElementById('login-view').style.display = 'block';
+        document.getElementById('quiz-views').style.display = 'none';
+        ['student-id','student-password'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('focus',function(){setGuideState('point');});});setGuideState('guide');
+        restoreStudentSession();
       });
     </script>
   </body>
