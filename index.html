@@ -1,0 +1,2629 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <!-- =========================================================
+         INFINITYFREE STUDENT FRONTEND -> GOOGLE APPS SCRIPT BRIDGE
+         This frontend remains hosted on InfinityFree.
+         Bridge.html remains hosted by Google Apps Script.
+         ========================================================= -->
+    <script>
+      const GAS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbzSZnpADHzS83OwPzkh7SaGqZyL2ZIrIXBTJ7W-GU7VYkditeD_9ALK9zUknbJ-dPbRtQ/exec?page=bridge';
+
+      let gasBridgeReady = false;
+      let gasBridgeFrame = null;
+      let gasBridgeSequence = 0;
+      const gasBridgeQueue = [];
+      const gasBridgePending = Object.create(null);
+
+      /*
+       * Emulates the Google Apps Script google.script.run builder.
+       * The existing Chem-Quiz frontend can therefore continue using:
+       *
+       * google.script.run
+       *   .withSuccessHandler(...)
+       *   .withFailureHandler(...)
+       *   .someServerFunction(...);
+       */
+      function createGasRunner(successHandler, failureHandler, userObject) {
+        const handlers = {
+          success: typeof successHandler === 'function' ? successHandler : null,
+          failure: typeof failureHandler === 'function' ? failureHandler : null,
+          userObject: userObject
+        };
+
+        return new Proxy({}, {
+          get: function(target, prop) {
+            if (prop === 'withSuccessHandler') {
+              return function(fn) {
+                return createGasRunner(fn, handlers.failure, handlers.userObject);
+              };
+            }
+
+            if (prop === 'withFailureHandler') {
+              return function(fn) {
+                return createGasRunner(handlers.success, fn, handlers.userObject);
+              };
+            }
+
+            if (prop === 'withUserObject') {
+              return function(obj) {
+                return createGasRunner(handlers.success, handlers.failure, obj);
+              };
+            }
+
+            return function() {
+              const args = Array.prototype.slice.call(arguments);
+
+              gasBridgeCall(
+                String(prop),
+                args,
+                handlers.success,
+                handlers.failure,
+                handlers.userObject
+              );
+            };
+          }
+        });
+      }
+
+      function makeGasRequestId() {
+        gasBridgeSequence += 1;
+        return 'chemquiz_' +
+          Date.now() + '_' +
+          gasBridgeSequence + '_' +
+          Math.random().toString(36).slice(2, 10);
+      }
+
+      function gasBridgeCall(method, args, success, failure, userObject) {
+        const request = {
+          type: 'gas-call',
+          id: makeGasRequestId(),
+          method: method,
+          args: Array.isArray(args) ? args : []
+        };
+
+        const pending = {
+          success: success,
+          failure: failure,
+          userObject: userObject
+        };
+
+        /*
+         * IMPORTANT:
+         * Register the pending callback BEFORE postMessage().
+         * This prevents a very fast Bridge response from arriving before
+         * the callback has been stored.
+         */
+        gasBridgePending[request.id] = pending;
+
+        if (!gasBridgeReady ||
+            !gasBridgeFrame ||
+            !gasBridgeFrame.contentWindow) {
+          gasBridgeQueue.push(request);
+          return;
+        }
+
+        sendGasRequest(request);
+      }
+
+      function sendGasRequest(request) {
+        try {
+          gasBridgeFrame.contentWindow.postMessage(request, '*');
+        } catch (err) {
+          const pending = gasBridgePending[request.id];
+
+          delete gasBridgePending[request.id];
+
+          if (pending && pending.failure) {
+            pending.failure(err, pending.userObject);
+          }
+        }
+      }
+
+      function flushGasBridgeQueue() {
+        if (!gasBridgeReady ||
+            !gasBridgeFrame ||
+            !gasBridgeFrame.contentWindow) {
+          return;
+        }
+
+        while (gasBridgeQueue.length > 0) {
+          sendGasRequest(gasBridgeQueue.shift());
+        }
+      }
+
+      function getBridgeUrl() {
+        /*
+         * GAS_WEB_APP_URL already contains ?page=bridge.
+         * Do not append another page=bridge parameter.
+         */
+        return GAS_WEB_APP_URL;
+      }
+
+      function initGasBridge() {
+        if (!GAS_WEB_APP_URL ||
+            GAS_WEB_APP_URL.indexOf('PASTE_YOUR_') === 0) {
+          console.error('Chem-Quiz: GAS_WEB_APP_URL is not configured.');
+          return;
+        }
+
+        if (gasBridgeFrame) return;
+
+        gasBridgeFrame = document.createElement('iframe');
+        gasBridgeFrame.id = 'gas-bridge-frame';
+        gasBridgeFrame.title = 'Google Apps Script Bridge';
+        gasBridgeFrame.setAttribute('aria-hidden', 'true');
+
+        gasBridgeFrame.style.position = 'fixed';
+        gasBridgeFrame.style.width = '1px';
+        gasBridgeFrame.style.height = '1px';
+        gasBridgeFrame.style.border = '0';
+        gasBridgeFrame.style.opacity = '0';
+        gasBridgeFrame.style.pointerEvents = 'none';
+        gasBridgeFrame.style.left = '-10px';
+        gasBridgeFrame.style.top = '-10px';
+
+        gasBridgeFrame.src = getBridgeUrl();
+
+        document.body.appendChild(gasBridgeFrame);
+      }
+
+      window.addEventListener('message', function(event) {
+        if (!gasBridgeFrame ||
+            event.source !== gasBridgeFrame.contentWindow) {
+          return;
+        }
+
+        const data = event.data || {};
+
+        if (data.type === 'gas-bridge-ready') {
+          gasBridgeReady = true;
+          flushGasBridgeQueue();
+          return;
+        }
+
+        if (data.type !== 'gas-result' || !data.id) {
+          return;
+        }
+
+        const pending = gasBridgePending[data.id];
+
+        if (!pending) return;
+
+        delete gasBridgePending[data.id];
+
+        if (data.ok) {
+          if (pending.success) {
+            pending.success(data.result, pending.userObject);
+          }
+        } else {
+          if (pending.failure) {
+            const error = new Error(
+              data.error || 'Google Apps Script request failed.'
+            );
+
+            pending.failure(error, pending.userObject);
+          }
+        }
+      });
+
+      /*
+       * Make google.script.run available BEFORE DOMContentLoaded.
+       * Calls made during startup are safely queued until Bridge.html
+       * reports gas-bridge-ready.
+       */
+      window.google = window.google || {};
+      window.google.script = window.google.script || {};
+      window.google.script.run = createGasRunner();
+
+      document.addEventListener('DOMContentLoaded', function() {
+        initGasBridge();
+      });
+    </script>
+<base target="_top">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, shrink-to-fit=no">
+    <title>Chem-Quiz · MCQ</title>
+    <!-- InfinityFree student frontend using Apps Script Bridge.html -->
+    
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Chem-Quiz">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#1a1a2e">
+    <meta name="full-screen" content="yes">
+    <meta name="browsermode" content="application">
+    <meta name="screen-orientation" content="portrait">
+    
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+        background: #f1f5f9;
+        min-height: 100vh;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        -webkit-tap-highlight-color: transparent;
+        overscroll-behavior: none;
+        width: 100%;
+        overflow-y: auto;
+        padding: 0;
+        margin: 0;
+      }
+      
+      /* ===== SPLASH SCREEN ===== */
+      #splash-screen {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        flex-direction: column;
+        transition: opacity 0.8s ease, transform 0.8s ease;
+      }
+      
+      #splash-screen.hidden {
+        opacity: 0;
+        transform: scale(1.1);
+        pointer-events: none;
+      }
+      
+      #splash-screen .splash-content {
+        text-align: center;
+        padding: 40px;
+        max-width: 400px;
+        width: 100%;
+      }
+      
+      #splash-screen .splash-logo {
+        font-size: 5rem;
+        display: block;
+        margin-bottom: 16px;
+        animation: pulse 2s ease-in-out infinite;
+      }
+      
+      #splash-screen .splash-logo img {
+        max-width: 150px;
+        max-height: 150px;
+        border-radius: 20px;
+        animation: pulse 2s ease-in-out infinite;
+      }
+      
+      #splash-screen h1 {
+        color: white;
+        font-size: 2.5rem;
+        font-weight: 900;
+        letter-spacing: -1px;
+        margin-bottom: 8px;
+      }
+      
+      #splash-screen h1 span {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      
+      #splash-screen .splash-subtitle {
+        color: rgba(255,255,255,0.6);
+        font-weight: 600;
+        font-size: 1rem;
+        margin-bottom: 30px;
+      }
+      
+      #splash-screen .splash-btn {
+        background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        color: #1a1a2e;
+        border: none;
+        padding: 16px 48px;
+        border-radius: 50px;
+        font-size: 1.2rem;
+        font-weight: 900;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 8px 32px rgba(245, 158, 11, 0.3);
+        letter-spacing: 1px;
+        position: relative;
+        overflow: hidden;
+      }
+      
+      #splash-screen .splash-btn:hover {
+        transform: translateY(-3px) scale(1.02);
+        box-shadow: 0 12px 40px rgba(245, 158, 11, 0.4);
+      }
+      
+      #splash-screen .splash-btn:active {
+        transform: scale(0.95);
+      }
+      
+      #splash-screen .splash-btn .arrow {
+        display: inline-block;
+        transition: transform 0.3s ease;
+        margin-left: 8px;
+      }
+      
+      #splash-screen .splash-btn:hover .arrow {
+        transform: translateX(6px);
+      }
+      
+      #splash-screen .splash-credit {
+        color: rgba(255,255,255,0.3);
+        font-size: 0.8rem;
+        margin-top: 24px;
+        font-weight: 600;
+      }
+      
+      @keyframes pulse {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.05); }
+      }
+      
+      /* ===== MAIN APP CONTAINER ===== */
+      .container {
+        max-width: 560px;
+        width: 100%;
+        min-height: 100vh;
+        background: #f1f5f9;
+        border-radius: 0;
+        padding: 16px 14px 30px;
+        overflow-y: visible;
+        scroll-behavior: smooth;
+        position: relative;
+        margin: 0 auto;
+        display: none;
+      }
+      
+      .container.active {
+        display: block;
+      }
+      
+      .container.fullscreen {
+        max-width: 100%;
+        padding: 20px 24px;
+      }
+      
+      .header {
+        text-align: center;
+        margin-bottom: 16px;
+        background: white;
+        padding: 18px 14px;
+        border-radius: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        position: relative;
+      }
+      
+      .header .app-logo {
+        max-width: 60px;
+        max-height: 60px;
+        border-radius: 12px;
+        margin-bottom: 4px;
+        display: inline-block;
+      }
+      
+      .header .icon { font-size: 2.8rem; margin-bottom: 2px; display: block; }
+      .header h1 { font-size: 1.8rem; font-weight: 900; color: #1a1a2e; letter-spacing: -0.5px; line-height: 1.2; }
+      .header h1 span { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+      .header .subtitle { color: #888; font-size: 0.9rem; margin-top: 2px; font-weight: 700; }
+      .header .quote {
+        color: #444;
+        font-style: italic;
+        font-size: 0.85rem;
+        margin-top: 8px;
+        padding: 12px 14px;
+        background: #f0f4ff;
+        border-radius: 14px;
+        border-left: 6px solid #667eea;
+        line-height: 1.4;
+        font-weight: 600;
+      }
+      .header .header-fullscreen-btn {
+        position: absolute;
+        top: 12px;
+        right: 14px;
+        background: rgba(102,126,234,0.1);
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 6px 10px;
+        cursor: pointer;
+        font-size: 1rem;
+        transition: all 0.2s ease;
+        color: #667eea;
+      }
+      .header .header-fullscreen-btn:hover { background: #667eea; color: white; border-color: #667eea; }
+      
+      .form-group { margin-bottom: 12px; }
+      .form-group label { display: block; font-weight: 800; color: #333; margin-bottom: 4px; font-size: 0.9rem; letter-spacing: -0.3px; }
+      .form-group label .required { color: #dc3545; }
+      .form-group input, .form-group select {
+        width: 100%;
+        padding: 12px 14px;
+        border: 2px solid #e0e0e0;
+        border-radius: 14px;
+        font-size: 1rem;
+        font-weight: 700;
+        transition: all 0.3s ease;
+        background: #f8f9fa;
+        color: #333;
+        -webkit-appearance: none;
+        appearance: none;
+      }
+      .form-group input:focus, .form-group select:focus {
+        outline: none;
+        border-color: #667eea;
+        background: white;
+        box-shadow: 0 0 0 4px rgba(102,126,234,0.15);
+      }
+      
+      .start-btn {
+        width: 100%;
+        padding: 14px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 14px;
+        font-size: 1.2rem;
+        font-weight: 900;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        margin-top: 8px;
+        letter-spacing: 0.5px;
+        box-shadow: 0 4px 16px rgba(79,70,229,0.25);
+      }
+      .start-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(79,70,229,0.35); }
+      .start-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+      
+      .primary-btn {
+        background: #059669;
+        color: white;
+        border: none;
+        padding: 12px 24px;
+        border-radius: 14px;
+        font-size: 1rem;
+        font-weight: 800;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        min-height: 46px;
+      }
+      .primary-btn:hover { background: #047857; transform: scale(1.02); }
+      .primary-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+      
+      .grid-btn {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        padding: 14px 10px;
+        border-radius: 14px;
+        font-size: 1rem;
+        font-weight: 800;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        text-align: center;
+        min-height: 50px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        word-break: break-word;
+        box-shadow: 0 2px 8px rgba(79,70,229,0.15);
+        position: relative;
+      }
+      .grid-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(79,70,229,0.25); }
+      
+      /* Flashcard badge on chapter button */
+      .grid-btn .flashcard-badge {
+        position: absolute;
+        top: -6px;
+        right: -6px;
+        background: #f59e0b;
+        color: white;
+        font-size: 0.6rem;
+        padding: 2px 6px;
+        border-radius: 10px;
+        font-weight: 700;
+        box-shadow: 0 2px 8px rgba(245, 158, 11, 0.4);
+      }
+      
+      .back-btn {
+        background: none;
+        border: none;
+        color: #667eea;
+        font-size: 1rem;
+        font-weight: 700;
+        cursor: pointer;
+        padding: 8px 0;
+        margin-bottom: 8px;
+        display: inline-block;
+      }
+      .back-btn:hover { text-decoration: underline; }
+      
+      .option-btn {
+        display: flex;
+        align-items: center;
+        padding: 14px 16px;
+        background: #f8fafc;
+        border: 2px solid #e2e8f0;
+        border-radius: 14px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: 1rem;
+        font-weight: 700;
+        min-height: 54px;
+        width: 100%;
+        text-align: left;
+      }
+      .option-btn:hover { background: #f1f5f9; border-color: #818cf8; }
+      .option-btn.selected { background: #667eea; color: white; border-color: #667eea; }
+      .option-btn .letter {
+        display: inline-block;
+        width: 32px;
+        height: 32px;
+        background: #e2e8f0;
+        border-radius: 50%;
+        text-align: center;
+        line-height: 32px;
+        margin-right: 12px;
+        font-weight: 900;
+        font-size: 0.9rem;
+        flex-shrink: 0;
+      }
+      .option-btn.selected .letter { background: rgba(255,255,255,0.2); }
+      
+      .question-nav-btn {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        border: 2px solid #e2e8f0;
+        background: white;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-weight: 800;
+        font-size: 0.9rem;
+      }
+      .question-nav-btn:hover { background: #667eea; color: white; border-color: #667eea; }
+      .question-nav-btn.answered { background: #059669; color: white; border-color: #059669; }
+      .question-nav-btn.current { background: #667eea; color: white; border-color: #667eea; transform: scale(1.1); }
+      
+      .error-message {
+        background: #fee2e2;
+        color: #991b1b;
+        padding: 12px 14px;
+        border-radius: 14px;
+        margin-bottom: 12px;
+        display: none;
+        font-size: 0.9rem;
+        font-weight: 700;
+        border: 1px solid #fecaca;
+      }
+      .error-message.show { display: block; animation: shake 0.3s ease; }
+      
+      @keyframes shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+      
+      .view { display: none; animation: fadeIn 0.3s ease; }
+      .view.active { display: block; }
+      
+      .grid-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 10px;
+        margin-top: 12px;
+      }
+      
+      .question-box {
+        background: #f8fafc;
+        padding: 16px;
+        border-radius: 14px;
+        margin: 12px 0;
+        font-size: 1.1rem;
+        font-weight: 700;
+        line-height: 1.5;
+        border-left: 6px solid #667eea;
+        color: #0f172a;
+      }
+      
+      /* ===== QUESTION IMAGE CONTAINER ===== */
+      #question-image-container {
+        text-align: center;
+        margin: 8px 0;
+        padding: 0;
+        min-height: 0;
+      }
+      
+      #question-image-container img {
+        max-width: 100%;
+        max-height: 250px;
+        border-radius: 8px;
+        object-fit: contain;
+        border: 1px solid #e2e8f0;
+        background: white;
+        padding: 4px;
+      }
+      
+      #question-image-container .image-loading {
+        color: #94a3b8;
+        font-size: 0.85rem;
+        font-weight: 600;
+        padding: 8px;
+      }
+      
+      #question-image-container.hidden {
+        display: none;
+      }
+      
+      #options-container {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin: 12px 0;
+      }
+      
+      .button-group { display: flex; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+      
+      .question-nav {
+        display: flex;
+        justify-content: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 10px 0;
+      }
+      
+      .timer-bar {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 8px 14px;
+        background: #f8fafc;
+        border-radius: 14px;
+        margin-bottom: 10px;
+        border: 2px solid #e2e8f0;
+        flex-shrink: 0;
+      }
+      .timer-bar .timer-label { font-weight: 800; color: #475569; font-size: 0.9rem; }
+      .timer-bar .timer-display {
+        font-size: 1.5rem;
+        font-weight: 900;
+        color: #667eea;
+        min-width: 40px;
+        text-align: center;
+      }
+      .timer-bar .timer-display.warning { color: #dc2626; animation: blink 0.5s ease infinite alternate; }
+      @keyframes blink { from { opacity: 1; } to { opacity: 0.3; } }
+      
+      .result-box {
+        text-align: center;
+        padding: 24px 20px;
+        background: white;
+        border-radius: 16px;
+        margin: 12px 0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        border: 1px solid #e2e8f0;
+      }
+      .result-score { font-size: 3.5rem; font-weight: 900; color: #667eea; margin: 6px 0; letter-spacing: -1px; }
+      .result-percentage { font-size: 1.8rem; font-weight: 900; color: #059669; margin: 4px 0; }
+      .result-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin: 16px 0; }
+      .result-stat { background: #f8fafc; padding: 12px 8px; border-radius: 14px; }
+      .result-stat .label { font-size: 0.7rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
+      .result-stat .value { font-size: 1.8rem; font-weight: 900; margin-top: 2px; }
+      .result-stat .value.correct { color: #059669; }
+      .result-stat .value.wrong { color: #dc2626; }
+      .result-stat .value.skip { color: #f59e0b; }
+      
+      .result-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        justify-content: center;
+        margin-top: 16px;
+      }
+      .result-actions button {
+        padding: 12px 16px;
+        border: none;
+        border-radius: 14px;
+        font-size: 0.9rem;
+        font-weight: 800;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        min-height: 44px;
+        flex: 1;
+        min-width: 100px;
+      }
+      .result-actions .retry-wrong { background: #f59e0b; color: #0f172a; }
+      .result-actions .retry-wrong:hover { background: #d97706; }
+      .result-actions .retry-all { background: #667eea; color: white; }
+      .result-actions .retry-all:hover { background: #4338ca; }
+      .result-actions .new-quiz { background: #059669; color: white; }
+      .result-actions .new-quiz:hover { background: #047857; }
+      
+      .loading { text-align: center; padding: 24px; color: #64748b; }
+      .spinner {
+        border: 4px solid #e2e8f0;
+        border-top: 4px solid #667eea;
+        border-radius: 50%;
+        width: 36px;
+        height: 36px;
+        animation: spin 1s linear infinite;
+        margin: 0 auto 12px;
+      }
+      @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+      
+      .stats-bar {
+        display: flex;
+        justify-content: center;
+        gap: 20px;
+        padding: 10px 0;
+        margin: 10px 0 6px;
+        border-top: 1px solid #e2e8f0;
+        border-bottom: 1px solid #e2e8f0;
+        flex-shrink: 0;
+        background: white;
+        border-radius: 14px;
+        padding: 10px 14px;
+      }
+      .stats-bar .stat { text-align: center; }
+      .stats-bar .stat .number { display: block; font-size: 1.3rem; font-weight: 900; color: #667eea; }
+      .stats-bar .stat .label { font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
+      
+      .footer {
+        margin-top: 16px;
+        padding-top: 12px;
+        border-top: 1px solid #e2e8f0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .footer .footer-links { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      .footer .footer-links a { color: #667eea; text-decoration: none; font-size: 0.9rem; font-weight: 700; cursor: pointer; padding: 4px 8px; border-radius: 8px; transition: background 0.2s; }
+      .footer .footer-links a:hover { background: #eef2ff; color: #4338ca; text-decoration: underline; }
+      .footer .contact { text-align: right; font-size: 0.8rem; color: #888; font-weight: 600; }
+      .footer .contact strong { color: #333; }
+      .footer .contact .phone { color: #667eea; font-weight: 800; }
+      
+      .welcome-banner {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 12px 16px;
+        border-radius: 14px;
+        margin-bottom: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+        flex-shrink: 0;
+        box-shadow: 0 4px 16px rgba(79,70,229,0.20);
+        position: relative;
+      }
+      .welcome-banner .user-info { font-weight: 800; font-size: 0.95rem; }
+      .welcome-banner .logout-btn {
+        background: rgba(255,255,255,0.2);
+        color: white;
+        border: 1px solid rgba(255,255,255,0.2);
+        padding: 6px 14px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-size: 0.85rem;
+        font-weight: 700;
+        transition: all 0.2s ease;
+      }
+      .welcome-banner .logout-btn:hover { background: rgba(255,255,255,0.3); }
+      
+      .fullscreen-btn {
+        background: rgba(255,255,255,0.2);
+        color: white;
+        border: 1px solid rgba(255,255,255,0.2);
+        padding: 6px 12px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-size: 0.85rem;
+        font-weight: 700;
+        transition: all 0.2s ease;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .fullscreen-btn:hover { background: rgba(255,255,255,0.3); }
+      .fullscreen-btn .icon { font-size: 1rem; }
+      
+      #question-progress { font-weight: 700; font-size: 0.9rem; color: #475569; margin-bottom: 4px; }
+      #question-counter, #score-display { font-weight: 800; font-size: 0.9rem; }
+      
+      .history-item {
+        background: white;
+        border-radius: 12px;
+        padding: 12px 14px;
+        margin: 8px 0;
+        border: 1px solid #e2e8f0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .history-item .h-topic { font-weight: 700; color: #0f172a; font-size: 0.95rem; }
+      .history-item .h-score { font-weight: 800; color: #667eea; background: #eef2ff; padding: 2px 12px; border-radius: 20px; font-size: 0.85rem; }
+      .history-item .h-date { font-size: 0.7rem; color: #94a3b8; }
+      .history-empty { text-align: center; padding: 30px 20px; color: #94a3b8; font-weight: 600; font-size: 0.95rem; }
+      
+      .chapter-switcher {
+        background: white;
+        border-radius: 16px;
+        padding: 16px;
+        margin: 10px 0;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+      }
+      .chapter-switcher h3 { font-size: 1rem; font-weight: 800; color: #0f172a; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+      .chapter-switcher .chapter-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+        gap: 8px;
+      }
+      .chapter-switcher .chapter-grid button {
+        padding: 8px 6px;
+        border: 2px solid #e2e8f0;
+        border-radius: 10px;
+        background: #f8fafc;
+        font-size: 0.8rem;
+        font-weight: 700;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        color: #0f172a;
+        text-align: center;
+        min-height: 36px;
+      }
+      .chapter-switcher .chapter-grid button:hover { background: #667eea; color: white; border-color: #667eea; }
+      .chapter-switcher .chapter-grid button.active-chapter { background: #667eea; color: white; border-color: #667eea; }
+      
+      .history-stats {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .history-stats .stat-box {
+        background: white;
+        padding: 10px 8px;
+        border-radius: 12px;
+        text-align: center;
+        border: 1px solid #e2e8f0;
+      }
+      .history-stats .stat-box .num { font-size: 1.3rem; font-weight: 900; color: #667eea; }
+      .history-stats .stat-box .lbl { font-size: 0.65rem; color: #94a3b8; text-transform: uppercase; font-weight: 700; }
+      
+      .history-filter {
+        margin-bottom: 12px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .history-filter input {
+        flex: 1;
+        min-width: 150px;
+        padding: 10px 14px;
+        border: 2px solid #e2e8f0;
+        border-radius: 12px;
+        font-size: 0.9rem;
+        font-weight: 600;
+      }
+      .history-filter input:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,0.15); }
+      .history-filter button { padding: 10px 18px; min-height: 40px; font-size: 0.85rem; }
+      
+      /* ===== LEADERBOARD - FIXED FOR MOBILE ===== */
+      .leaderboard-box {
+        background: white;
+        border-radius: 16px;
+        padding: 12px;
+        margin: 12px 0;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+        overflow: hidden;
+      }
+      
+      .leaderboard-box h3 { 
+        font-size: 1rem; 
+        font-weight: 900; 
+        color: #0f172a; 
+        margin-bottom: 10px; 
+        display: flex; 
+        align-items: center; 
+        gap: 6px;
+      }
+      .leaderboard-box h3 .trophy { font-size: 1.1rem; }
+      
+      .leaderboard-item {
+        display: flex;
+        align-items: center;
+        padding: 8px 10px;
+        border-bottom: 1px solid #f1f5f9;
+        gap: 8px;
+        flex-wrap: nowrap;
+      }
+      .leaderboard-item:last-child { border-bottom: none; }
+      
+      .leaderboard-item .rank { 
+        font-size: 1rem; 
+        font-weight: 900; 
+        width: 30px; 
+        text-align: center; 
+        color: #94a3b8;
+        flex-shrink: 0;
+      }
+      .leaderboard-item .rank.gold { color: #f59e0b; }
+      .leaderboard-item .rank.silver { color: #94a3b8; }
+      .leaderboard-item .rank.bronze { color: #d97706; }
+      
+      .leaderboard-item .info { 
+        flex: 1; 
+        min-width: 0;
+        overflow: hidden;
+      }
+      .leaderboard-item .info .name { 
+        font-weight: 700; 
+        color: #0f172a; 
+        font-size: 0.85rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .leaderboard-item .info .detail { 
+        font-size: 0.65rem; 
+        color: #94a3b8;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      
+      .leaderboard-item .score {
+        font-weight: 800;
+        color: #667eea;
+        font-size: 0.8rem;
+        background: #eef2ff;
+        padding: 2px 10px;
+        border-radius: 20px;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      
+      .leaderboard-empty { 
+        text-align: center; 
+        padding: 16px; 
+        color: #94a3b8; 
+        font-weight: 600; 
+        font-size: 0.85rem; 
+      }
+      .leaderboard-item.current-user { 
+        background: #eef2ff; 
+        border-radius: 8px; 
+        border-left: 4px solid #667eea; 
+      }
+      
+      .leaderboard-refresh-btn {
+        padding: 4px 12px;
+        background: #eef2ff;
+        color: #667eea;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 700;
+        font-size: 0.65rem;
+        transition: all 0.2s ease;
+        flex-shrink: 0;
+      }
+      .leaderboard-refresh-btn:hover { background: #667eea; color: white; }
+      
+      /* ===== HISTORY SCROLL FIX ===== */
+      #history-content {
+        max-height: 60vh;
+        overflow-y: auto;
+        padding-right: 8px;
+        scroll-behavior: smooth;
+        -webkit-overflow-scrolling: touch;
+      }
+      
+      #history-content::-webkit-scrollbar {
+        width: 5px;
+      }
+      #history-content::-webkit-scrollbar-track {
+        background: #f1f5f9;
+        border-radius: 10px;
+      }
+      #history-content::-webkit-scrollbar-thumb {
+        background: #667eea;
+        border-radius: 10px;
+      }
+      #history-content::-webkit-scrollbar-thumb:hover {
+        background: #4338ca;
+      }
+      
+      /* History auth section */
+      #history-auth {
+        background: white;
+        border-radius: 16px;
+        padding: 16px;
+        margin: 12px 0;
+        border: 1px solid #e2e8f0;
+      }
+      
+      /* Responsive */
+      @media (max-width:600px) {
+        .container { padding: 12px 10px 20px; }
+        .header { padding: 14px 12px; border-radius: 16px; }
+        .header .icon { font-size: 2.4rem; }
+        .header h1 { font-size: 1.5rem; }
+        .header .subtitle { font-size: 0.8rem; }
+        .header .quote { font-size: 0.8rem; padding: 10px 12px; }
+        .header .header-fullscreen-btn { top: 8px; right: 10px; padding: 4px 8px; font-size: 0.85rem; }
+        .form-group label { font-size: 0.85rem; }
+        .form-group input, .form-group select { font-size: 0.9rem; padding: 10px 12px; border-radius: 12px; }
+        .grid-btn { font-size: 0.85rem; padding: 10px 8px; min-height: 42px; border-radius: 12px; }
+        .grid-container { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; }
+        .option-btn { font-size: 0.9rem; padding: 10px 12px; min-height: 46px; border-radius: 12px; }
+        .option-btn .letter { width: 28px; height: 28px; line-height: 28px; font-size: 0.8rem; margin-right: 10px; }
+        .start-btn { font-size: 1.05rem; padding: 12px; border-radius: 12px; }
+        .primary-btn { font-size: 0.9rem; padding: 10px 18px; min-height: 40px; border-radius: 12px; }
+        .question-box { font-size: 1rem; padding: 14px; border-radius: 12px; }
+        #question-image-container img { max-height: 180px; }
+        .timer-bar .timer-display { font-size: 1.3rem; }
+        .timer-bar .timer-label { font-size: 0.85rem; }
+        .result-score { font-size: 2.8rem; }
+        .result-percentage { font-size: 1.5rem; }
+        .result-stats { grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+        .result-stat .value { font-size: 1.4rem; }
+        .result-stat .label { font-size: 0.6rem; }
+        .question-nav-btn { width: 34px; height: 34px; font-size: 0.8rem; }
+        .stats-bar .stat .number { font-size: 1.1rem; }
+        .stats-bar { gap: 14px; padding: 8px 10px; }
+        .footer .footer-links a { font-size: 0.8rem; }
+        .footer .contact { font-size: 0.7rem; }
+        .result-actions button { font-size: 0.8rem; padding: 10px 12px; min-height: 38px; border-radius: 12px; }
+        .welcome-banner .user-info { font-size: 0.85rem; }
+        .welcome-banner .logout-btn { font-size: 0.75rem; padding: 4px 10px; }
+        .fullscreen-btn { font-size: 0.75rem; padding: 4px 10px; }
+        .back-btn { font-size: 0.9rem; }
+        .error-message { font-size: 0.8rem; padding: 10px 12px; }
+        .history-item { padding: 10px 12px; }
+        .history-item .h-topic { font-size: 0.85rem; }
+        .history-item .h-score { font-size: 0.75rem; padding: 2px 10px; }
+        .chapter-switcher .chapter-grid { grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); }
+        .chapter-switcher .chapter-grid button { font-size: 0.7rem; padding: 6px 4px; min-height: 30px; }
+        .history-stats { grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+        .history-stats .stat-box .num { font-size: 1.1rem; }
+        .history-stats .stat-box .lbl { font-size: 0.6rem; }
+        .history-filter input { font-size: 0.85rem; padding: 8px 12px; }
+        .history-filter button { font-size: 0.8rem; padding: 8px 14px; min-height: 36px; }
+        
+        /* Leaderboard mobile */
+        .leaderboard-item { padding: 6px 8px; gap: 6px; }
+        .leaderboard-item .rank { font-size: 0.9rem; width: 24px; }
+        .leaderboard-item .info .name { font-size: 0.8rem; }
+        .leaderboard-item .score { font-size: 0.7rem; padding: 2px 8px; }
+        .leaderboard-box { padding: 10px; }
+        .leaderboard-box h3 { font-size: 0.9rem; }
+        
+        #history-content { max-height: 50vh; }
+        .container.fullscreen { padding: 12px 14px; }
+        
+        #splash-screen .splash-logo { font-size: 3.5rem; }
+        #splash-screen .splash-logo img { max-width: 100px; max-height: 100px; }
+        #splash-screen h1 { font-size: 2rem; }
+        #splash-screen .splash-btn { padding: 14px 32px; font-size: 1rem; }
+      }
+
+      @media (max-width:380px) {
+        .container { padding: 8px 6px 16px; }
+        .header h1 { font-size: 1.2rem; }
+        .header .header-fullscreen-btn { top: 6px; right: 8px; padding: 3px 6px; font-size: 0.75rem; }
+        .grid-container { grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); }
+        .grid-btn { font-size: 0.75rem; padding: 8px 4px; min-height: 34px; border-radius: 10px; }
+        .option-btn { font-size: 0.8rem; padding: 8px 10px; min-height: 38px; }
+        .option-btn .letter { width: 24px; height: 24px; line-height: 24px; font-size: 0.7rem; }
+        .result-score { font-size: 2.2rem; }
+        .result-percentage { font-size: 1.2rem; }
+        .result-stats { grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
+        .result-stat .value { font-size: 1.1rem; }
+        .question-nav-btn { width: 28px; height: 28px; font-size: 0.7rem; }
+        .timer-bar .timer-display { font-size: 1.1rem; }
+        .stats-bar .stat .number { font-size: 0.9rem; }
+        .primary-btn { font-size: 0.8rem; padding: 8px 14px; min-height: 34px; }
+        .start-btn { font-size: 0.9rem; padding: 10px; }
+        .question-box { font-size: 0.85rem; padding: 10px; }
+        #question-image-container img { max-height: 140px; }
+        .result-actions button { font-size: 0.7rem; padding: 8px 10px; min-height: 32px; }
+        .chapter-switcher .chapter-grid { grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); }
+        .chapter-switcher .chapter-grid button { font-size: 0.65rem; padding: 4px 3px; min-height: 26px; }
+        .history-stats { grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
+        .history-stats .stat-box .num { font-size: 0.9rem; }
+        .history-filter input { font-size: 0.8rem; padding: 6px 10px; }
+        
+        .leaderboard-item { padding: 4px 6px; gap: 4px; }
+        .leaderboard-item .rank { font-size: 0.8rem; width: 20px; }
+        .leaderboard-item .info .name { font-size: 0.75rem; }
+        .leaderboard-item .score { font-size: 0.65rem; padding: 2px 6px; }
+        .leaderboard-box { padding: 8px; }
+        .leaderboard-box h3 { font-size: 0.8rem; }
+        
+        #history-content { max-height: 40vh; }
+        .container.fullscreen { padding: 6px 8px; }
+        
+        #splash-screen .splash-logo { font-size: 3rem; }
+        #splash-screen .splash-logo img { max-width: 80px; max-height: 80px; }
+        #splash-screen h1 { font-size: 1.6rem; }
+        #splash-screen .splash-btn { padding: 12px 24px; font-size: 0.9rem; }
+      }
+
+      @media all and (display-mode: standalone) {
+        body { padding: 0 !important; margin: 0 !important; background: #f1f5f9; width: 100%; overflow-y: auto; }
+        .container { border-radius: 0 !important; box-shadow: none !important; max-width: 100% !important; margin: 0 !important; padding: 14px 12px 24px !important; min-height: 100vh !important; border: none; background: #f1f5f9; overflow-y: visible; position: relative; }
+      }
+    
+      /* ===== ANNOUNCEMENT TICKER ===== */
+      .announcement-ticker {
+        width: 100%;
+        margin: 10px 0 14px;
+        background: #fff;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        overflow: hidden;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        display: flex;
+        align-items: center;
+        min-height: 42px;
+      }
+      .announcement-ticker-label {
+        flex: 0 0 auto;
+        padding: 10px 12px;
+        background: #667eea;
+        color: #fff;
+        font-size: 0.78rem;
+        font-weight: 900;
+        z-index: 2;
+      }
+      .announcement-ticker-window {
+        flex: 1 1 auto;
+        overflow: hidden;
+        white-space: nowrap;
+        position: relative;
+      }
+      #announcementTickerTrack {
+        display: flex;
+        width: max-content;
+        will-change: transform;
+        animation: announcementTickerMove 80s linear infinite;
+      }
+      .ticker-segment {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+      }
+      .announcement-ticker-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 10px 18px;
+        color: #334155;
+        font-size: 0.82rem;
+        font-weight: 700;
+      }
+      .ticker-title { color: #667eea; font-weight: 900; }
+      .ticker-separator { color: #94a3b8; padding: 0 4px; }
+      @keyframes announcementTickerMove {
+        from { transform: translateX(0); }
+        to { transform: translateX(-50%); }
+      }
+
+    </style>
+  </head>
+  <body>
+    
+    <!-- ===== SPLASH SCREEN ===== -->
+    <div id="splash-screen">
+      <div class="splash-content">
+        <span class="splash-logo" id="splashLogo">🧪</span>
+        <h1>Welcome to <span>Chem-Quiz</span></h1>
+        <div class="splash-subtitle">Master Chemistry with Interactive MCQs</div>
+        <button class="splash-btn" onclick="enterApp()">
+          Start Learning <span class="arrow">➜</span>
+        </button>
+        <div class="splash-credit">by Faizan Siddiqui</div>
+      </div>
+    </div>
+    
+    <!-- ===== MAIN APP ===== -->
+    <div class="container" id="main-container">
+      
+      <!-- ===== LOGIN VIEW ===== -->
+      <div id="login-view" class="login-view">
+        <div class="header">
+          <button class="header-fullscreen-btn" onclick="toggleFullScreen()" title="Toggle Full Screen">⛶</button>
+          <span id="appLogoDisplay" class="icon">🧪</span>
+          <h1>Welcome to <span>Chem-Quiz</span></h1>
+          <div class="subtitle">by Faizan Siddiqui</div>
+          <div class="quote">
+            "Just like carbon under intense pressure, your greatest challenges are simply transforming you into something brilliant and indestructible."
+          </div>
+        </div>
+
+
+        <div class="announcement-ticker" id="announcementTicker" aria-label="Announcements">
+          <div class="announcement-ticker-label">📢 Announcements</div>
+          <div class="announcement-ticker-window">
+            <div id="announcementTickerTrack">
+              <div class="ticker-segment">
+                <span class="announcement-ticker-item">📢 Loading announcements...</span>
+              </div>
+              <div class="ticker-segment">
+                <span class="announcement-ticker-item">📢 Loading announcements...</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="login-error" class="error-message"></div>
+
+        <div class="login-form">
+          <div class="form-group">
+            <label>🆔 Student ID <span class="required">*</span></label>
+            <input type="text" id="student-id" placeholder="Enter your Student ID (e.g., S001)" maxlength="20" autofocus>
+          </div>
+
+          <div class="form-group">
+            <label>🔑 Password <span class="required">*</span></label>
+            <input type="password" id="student-password" placeholder="Enter your password" maxlength="50">
+          </div>
+
+          <button id="start-btn" class="start-btn" onclick="handleLogin()">
+            🚀 Login & Start Quiz
+          </button>
+        </div>
+
+        <div class="stats-bar">
+          <div class="stat">
+            <span class="number" id="total-questions">0</span>
+            <span class="label">Total Questions</span>
+          </div>
+          <div class="stat">
+            <span class="number" id="total-classes">6</span>
+            <span class="label">Classes</span>
+          </div>
+          <div class="stat">
+            <span class="number" id="total-chapters">0</span>
+            <span class="label">Chapters</span>
+          </div>
+        </div>
+
+        <div class="footer">
+          <div class="footer-links">
+            <a onclick="showFile()">📄 File</a>
+            <a onclick="showHistoryView()">📜 History</a>
+          </div>
+          <div class="contact">
+            <strong>Contact Us:</strong> Faizan Siddiqui<br>
+            <span class="phone">📞 0300-3344355</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== QUIZ VIEWS ===== -->
+      <div id="quiz-views" class="quiz-views" style="display:none;">
+        <div class="welcome-banner">
+          <div>
+            <div class="user-info" id="welcome-user">👋 Welcome!</div>
+            <div style="font-size:0.8rem;opacity:0.8;font-weight:700;" id="welcome-class">ID: - | Class: -</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <button class="fullscreen-btn" onclick="toggleFullScreen()" title="Toggle Full Screen">
+              <span class="icon">⛶</span> Full Screen
+            </button>
+            <button class="logout-btn" onclick="toggleFileMenu()" style="background:rgba(255,255,255,0.15);">📄</button>
+            <button class="logout-btn" onclick="showHistoryView()" style="background:rgba(255,255,255,0.15);">📜</button>
+            <button class="logout-btn" onclick="handleLogout()">🚪 Logout</button>
+          </div>
+        </div>
+
+        <div id="file-menu" class="chapter-switcher" style="display:none;">
+          <h3>📚 Switch Chapter</h3>
+          <div id="chapter-switcher-grid" class="chapter-grid"></div>
+        </div>
+
+        <div id="class-view" class="view active">
+          <h2 style="font-size:1.2rem;font-weight:900;color:#0f172a;">📚 Select a Chapter</h2>
+          <div id="chapter-list" class="grid-container"></div>
+        </div>
+
+        <div id="topic-view" class="view hidden">
+          <h2 id="chapter-title" style="font-size:1.2rem;font-weight:900;color:#0f172a;"></h2>
+          <button class="back-btn" onclick="showView('class-view')">⬅ Back to Chapters</button>
+          <div id="topic-list" class="grid-container"></div>
+        </div>
+
+        <div id="count-view" class="view hidden">
+          <h2 id="topic-title" style="font-size:1.2rem;font-weight:900;color:#0f172a;"></h2>
+          <p style="color:#64748b;margin:6px 0;font-weight:700;font-size:0.9rem;">Select how many questions you want to practice:</p>
+          <button class="back-btn" onclick="showView('topic-view')">⬅ Back to Topics</button>
+          <div id="count-list" class="grid-container"></div>
+        </div>
+
+        <div id="quiz-view" class="view hidden">
+          <h2 id="quiz-header" style="font-size:1.2rem;font-weight:900;color:#0f172a;"></h2>
+          <div id="question-progress" style="font-weight:700;font-size:0.9rem;color:#475569;margin-bottom:4px;">Question 1 of 10</div>
+          <div class="timer-bar">
+            <span class="timer-label">⏱️ Time Remaining:</span>
+            <span class="timer-display" id="timer-display">60</span>
+            <span style="font-size:0.85rem;color:#64748b;font-weight:700;">seconds</span>
+          </div>
+          <div class="question-nav" id="question-nav"></div>
+          <div id="question-text" class="question-box"></div>
+          <div id="question-image-container" class="hidden"></div>
+          <div id="options-container"></div>
+          <div class="button-group">
+            <button id="submit-btn" onclick="submitAnswer()" class="primary-btn">Submit Answer</button>
+          </div>
+        </div>
+
+        <div id="results-view" class="view hidden">
+          <h2 style="font-size:1.3rem;font-weight:900;color:#0f172a;">📊 Quiz Results</h2>
+          <div id="results-content" class="result-box"></div>
+          <div id="leaderboard-container"></div>
+          <div class="result-actions">
+            <button class="retry-wrong" onclick="retryWrongQuestions()">🔄 Retry Wrong</button>
+            <button class="retry-all" onclick="retryAllQuestions()">🔄 Retry All</button>
+            <button class="new-quiz" onclick="resetQuiz()">📚 New Quiz</button>
+          </div>
+        </div>
+
+        <!-- ===== HISTORY VIEW - FIXED ===== -->
+        <div id="history-view" class="view hidden">
+          <h2 style="font-size:1.2rem;font-weight:900;color:#0f172a;">📜 Quiz History</h2>
+          <button class="back-btn" onclick="goBackFromHistory()">⬅ Back</button>
+          
+          <div id="history-auth">
+            <p style="color:#475569;font-weight:700;margin-bottom:10px;">🔐 Enter Student ID and Password to view history:</p>
+            
+            <div class="form-group" style="margin-bottom:10px;">
+              <label style="font-size:0.85rem;">🆔 Student ID</label>
+              <input type="text" id="history-student-id" placeholder="Enter Student ID (e.g., S001)" style="width:100%;padding:10px 14px;border:2px solid #e0e0e0;border-radius:12px;font-size:1rem;font-weight:600;">
+            </div>
+            
+            <div class="form-group" style="margin-bottom:10px;">
+              <label style="font-size:0.85rem;">🔑 Password</label>
+              <input type="password" id="history-password" placeholder="Enter your password" style="width:100%;padding:10px 14px;border:2px solid #e0e0e0;border-radius:12px;font-size:1rem;font-weight:600;">
+            </div>
+            
+            <button onclick="loadMyHistory()" class="primary-btn" style="width:100%;padding:12px;min-height:44px;font-size:1rem;">
+              🔓 View History
+            </button>
+            
+            <div id="history-auth-error" style="color:#dc2626;font-weight:600;font-size:0.85rem;margin-top:8px;display:none;"></div>
+          </div>
+          
+          <div id="history-content">
+            <div class="history-empty">Enter Student ID and Password, then click "View History" to see quiz history.</div>
+          </div>
+        </div>
+
+        <div class="stats-bar" style="border-top:1px solid #e2e8f0;margin-top:12px;">
+          <span id="question-counter" style="font-weight:800;font-size:0.9rem;">0 / 0</span>
+          <span id="score-display" style="font-weight:800;font-size:0.9rem;">✅ 0 correct</span>
+        </div>
+      </div>
+
+    </div>
+
+    <script>
+      // ============================================
+      // CHEM-QUIZ - Frontend JavaScript
+      // ============================================
+
+      // ========== SPLASH SCREEN FUNCTIONS ==========
+      function enterApp() {
+        var splash = document.getElementById('splash-screen');
+        splash.classList.add('hidden');
+        
+        document.getElementById('main-container').classList.add('active');
+        
+        setTimeout(function() {
+          var container = document.getElementById('main-container');
+          if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+            if (container.requestFullscreen) {
+              container.requestFullscreen();
+            } else if (container.webkitRequestFullscreen) {
+              container.webkitRequestFullscreen();
+            }
+            container.classList.add('fullscreen');
+          }
+        }, 500);
+        
+        loadAppLogo();
+        loadStats();
+      }
+
+      // ========== LOAD APP LOGO ==========
+      function loadAppLogo() {
+        if (!window.google || !google.script || !google.script.run) return;
+
+        google.script.run
+          .withSuccessHandler(function(logoData) {
+            if (logoData && logoData.dataUri) {
+              var splashLogo = document.getElementById('splashLogo');
+              if (splashLogo) {
+                splashLogo.innerHTML =
+                  '<img src="' + logoData.dataUri +
+                  '" style="max-width:150px;max-height:150px;border-radius:20px;">';
+              }
+
+              var appLogo = document.getElementById('appLogoDisplay');
+              if (appLogo) {
+                appLogo.innerHTML =
+                  '<img src="' + logoData.dataUri + '" class="app-logo">';
+              }
+            }
+          })
+          .withFailureHandler(function(error) {
+            console.warn('Logo could not be loaded:', error);
+          })
+          .getLogo();
+      }
+
+      // ========== ANNOUNCEMENT TICKER ==========
+      function escapeTickerHtml(value) {
+        return String(value == null ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function loadAnnouncementsTicker() {
+        var track = document.getElementById('announcementTickerTrack');
+        if (!track || !window.google || !google.script || !google.script.run) return;
+
+        google.script.run
+          .withSuccessHandler(function(announcements) {
+            if (announcements && announcements.error) {
+              track.innerHTML =
+                '<div class="ticker-segment"><span class="announcement-ticker-item">📢 Announcements unavailable right now.</span></div>';
+              return;
+            }
+
+            if (!Array.isArray(announcements) || announcements.length === 0) {
+              track.innerHTML =
+                '<div class="ticker-segment"><span class="announcement-ticker-item">📢 No new announcements at this time.</span></div>';
+              track.style.animation = 'none';
+              return;
+            }
+
+            var items = announcements.map(function(a) {
+              var title = escapeTickerHtml(a && a.title ? a.title : 'Announcement');
+              var message = escapeTickerHtml(a && a.message ? a.message : '');
+              return '<span class="announcement-ticker-item">' +
+                '<span class="ticker-title">' + title + '</span>' +
+                (message ? '<span class="ticker-separator">•</span>' + message : '') +
+                '<span class="ticker-separator">•</span>' +
+                '</span>';
+            }).join('');
+
+            var continuousContent =
+              '<div class="ticker-segment">' + items + '</div>' +
+              '<div class="ticker-segment">' + items + '</div>';
+
+            track.innerHTML = continuousContent;
+            track.style.animation = 'announcementTickerMove 80s linear infinite';
+          })
+          .withFailureHandler(function(error) {
+            console.warn('Announcements could not be loaded:', error);
+            track.innerHTML =
+              '<div class="ticker-segment"><span class="announcement-ticker-item">📢 Unable to load announcements.</span></div>';
+          })
+          .getActiveAnnouncements();
+      }
+
+      // ========== FULL SCREEN FUNCTIONS ==========
+      function toggleFullScreen() {
+        var container = document.getElementById('main-container');
+        if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+          if (container.requestFullscreen) {
+            container.requestFullscreen();
+          } else if (container.webkitRequestFullscreen) {
+            container.webkitRequestFullscreen();
+          }
+          container.classList.add('fullscreen');
+        } else {
+          if (document.exitFullscreen) {
+            document.exitFullscreen();
+          } else if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen();
+          }
+          container.classList.remove('fullscreen');
+        }
+      }
+
+      document.addEventListener('fullscreenchange', function() {
+        var container = document.getElementById('main-container');
+        if (!document.fullscreenElement) {
+          container.classList.remove('fullscreen');
+        }
+      });
+      document.addEventListener('webkitfullscreenchange', function() {
+        var container = document.getElementById('main-container');
+        if (!document.webkitFullscreenElement) {
+          container.classList.remove('fullscreen');
+        }
+      });
+
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+          var loginView = document.getElementById('login-view');
+          if (loginView.style.display !== 'none') {
+            handleLogin();
+          }
+        }
+      });
+
+      var quizHistory = JSON.parse(localStorage.getItem('chemQuizHistory')) || [];
+
+      function saveToHistory(entry) {
+        quizHistory.push(entry);
+        localStorage.setItem('chemQuizHistory', JSON.stringify(quizHistory));
+      }
+
+      var state = {
+        studentId: '',
+        studentName: '',
+        studentClass: '',
+        studentEmail: '',
+        studentWhatsApp: '',
+        chapters: [],
+        topics: [],
+        questions: [],
+        currentQuestionIndex: 0,
+        selectedOption: '',
+        answers: {},
+        answerResults: {},
+        correctAnswers: {},
+        score: 0,
+        attempted: 0,
+        timer: 60,
+        timerInterval: null,
+        quizCompleted: false,
+        totalQuestions: 0,
+        previousView: 'class-view',
+        allChapters: [],
+        chapter: '',
+        topic: '',
+        flashcardChapters: []
+      };
+
+      // ========== LOGIN FUNCTION ==========
+      function handleLogin() {
+        var studentId = document.getElementById('student-id').value.trim();
+        var password = document.getElementById('student-password').value.trim();
+        var errorDiv = document.getElementById('login-error');
+
+        errorDiv.className = 'error-message';
+
+        if (!studentId) {
+          errorDiv.textContent = '⚠️ Please enter your Student ID.';
+          errorDiv.className = 'error-message show';
+          setTimeout(function() { errorDiv.className = 'error-message'; }, 3000);
+          return;
+        }
+        if (!password || password.length < 4) {
+          errorDiv.textContent = '⚠️ Please enter your password (minimum 4 characters).';
+          errorDiv.className = 'error-message show';
+          setTimeout(function() { errorDiv.className = 'error-message'; }, 3000);
+          return;
+        }
+
+        var btn = document.getElementById('start-btn');
+        btn.disabled = true;
+        btn.textContent = '⏳ Logging in...';
+
+        google.script.run
+          .withSuccessHandler(function(result) {
+            btn.disabled = false;
+            btn.textContent = '🚀 Login & Start Quiz';
+            
+            if (result.success) {
+              state.studentId = result.student.id;
+              state.studentName = result.student.name;
+              state.studentClass = result.student.class;
+              state.studentEmail = result.student.email || '';
+              state.studentWhatsApp = result.student.whatsapp || '';
+              
+              console.log("✅ Login successful!");
+              console.log("Student:", state.studentId, state.studentName);
+              console.log("Class:", state.studentClass);
+              
+              document.getElementById('login-view').style.display = 'none';
+              document.getElementById('quiz-views').style.display = 'block';
+              
+              document.getElementById('welcome-user').textContent = '👋 Welcome, ' + state.studentName + '!';
+              document.getElementById('welcome-class').textContent = 'ID: ' + state.studentId + ' | Class: ' + state.studentClass;
+              
+              loadChapters(state.studentClass);
+              loadFlashcardChapters();
+            } else {
+              errorDiv.textContent = '❌ ' + result.message;
+              errorDiv.className = 'error-message show';
+              setTimeout(function() { errorDiv.className = 'error-message'; }, 3000);
+            }
+          })
+          .withFailureHandler(function(error) {
+            btn.disabled = false;
+            btn.textContent = '🚀 Login & Start Quiz';
+            errorDiv.textContent = '❌ Error: ' + error;
+            errorDiv.className = 'error-message show';
+            setTimeout(function() { errorDiv.className = 'error-message'; }, 3000);
+          })
+          .loginStudent(studentId, password);
+      }
+
+      // ========== LOAD FLASHCARD CHAPTERS ==========
+      function loadFlashcardChapters() {
+        google.script.run
+          .withSuccessHandler(function(chapters) {
+            state.flashcardChapters = chapters || [];
+          })
+          .withFailureHandler(function() {})
+          .getFlashcardChapters(state.studentClass);
+      }
+
+      // ========== DISPLAY QUESTION IMAGE ==========
+      function displayQuestionImage(imageUrl) {
+        var container = document.getElementById('question-image-container');
+        container.innerHTML = '';
+        
+        if (!imageUrl || imageUrl === '' || imageUrl === 'undefined' || imageUrl === 'null') {
+          container.classList.add('hidden');
+          return;
+        }
+        
+        container.classList.remove('hidden');
+        
+        if (imageUrl.startsWith('data:image')) {
+          container.innerHTML = '<img src="' + imageUrl + '" alt="Question Image">';
+          return;
+        }
+        
+        container.innerHTML = '<div class="image-loading">🔄 Loading image...</div>';
+        
+        google.script.run
+          .withSuccessHandler(function(dataUri) {
+            if (dataUri && dataUri !== 'null' && dataUri !== '') {
+              container.innerHTML = '<img src="' + dataUri + '" alt="Question Image">';
+            } else {
+              container.innerHTML = '';
+              container.classList.add('hidden');
+            }
+          })
+          .withFailureHandler(function() {
+            container.innerHTML = '';
+            container.classList.add('hidden');
+          })
+          .getImageDataUri(imageUrl);
+      }
+
+      // ========== OTHER FUNCTIONS ==========
+      
+      function handleLogout() {
+        stopTimer();
+        document.getElementById('login-view').style.display = 'block';
+        document.getElementById('quiz-views').style.display = 'none';
+        document.getElementById('student-id').value = '';
+        document.getElementById('student-password').value = '';
+        document.getElementById('file-menu').style.display = 'none';
+        document.querySelectorAll('#quiz-views .view').forEach(function(el) {
+          el.classList.remove('active');
+        });
+        document.getElementById('class-view').classList.add('active');
+        if (document.fullscreenElement || document.webkitFullscreenElement) {
+          if (document.exitFullscreen) document.exitFullscreen();
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+          document.getElementById('main-container').classList.remove('fullscreen');
+        }
+      }
+
+      function toggleFileMenu() {
+        var menu = document.getElementById('file-menu');
+        if (menu.style.display === 'none' || menu.style.display === '') {
+          menu.style.display = 'block';
+          renderChapterSwitcher();
+        } else {
+          menu.style.display = 'none';
+        }
+      }
+
+      function renderChapterSwitcher() {
+        var container = document.getElementById('chapter-switcher-grid');
+        container.innerHTML = '';
+        
+        if (!state.allChapters || state.allChapters.length === 0) {
+          container.innerHTML = '<p style="color:#64748b;font-size:0.85rem;padding:10px;">No chapters available</p>';
+          return;
+        }
+
+        state.allChapters.forEach(function(chapter) {
+          var btn = document.createElement('button');
+          btn.textContent = chapter;
+          if (chapter === state.chapter) {
+            btn.classList.add('active-chapter');
+          }
+          btn.onclick = function() {
+            document.getElementById('file-menu').style.display = 'none';
+            state.chapter = chapter;
+            stopTimer();
+            showView('topic-view');
+            document.getElementById('chapter-title').textContent = '📝 ' + chapter + ' - Topics';
+            showLoading('topic-list');
+            google.script.run
+              .withSuccessHandler(function(topics) {
+                state.topics = topics;
+                renderTopics(topics);
+              })
+              .withFailureHandler(function(error) {
+                document.getElementById('topic-list').innerHTML = `<p style="color:#dc2626;text-align:center;padding:20px;font-weight:600;">❌ Error: ${error}</p>`;
+              })
+              .getTopics(state.studentClass, chapter);
+          };
+          container.appendChild(btn);
+        });
+      }
+
+      function showHistoryView() {
+        state.previousView = document.querySelector('#quiz-views .view.active')?.id || 'class-view';
+        document.getElementById('file-menu').style.display = 'none';
+        showView('history-view');
+        
+        document.getElementById('history-student-id').value = '';
+        document.getElementById('history-password').value = '';
+        document.getElementById('history-auth-error').style.display = 'none';
+        
+        var container = document.getElementById('history-content');
+        container.innerHTML = `
+          <div class="history-empty">Enter Student ID and Password, then click "View History" to see quiz history.</div>
+        `;
+      }
+
+      function getErrorMessage(error) {
+        if (!error) return 'Unknown error';
+        if (typeof error === 'string') return error;
+        if (error.message) return error.message;
+        try { return JSON.stringify(error); } catch (e) { return String(error); }
+      }
+
+      function loadMyHistory() {
+        var studentId = document.getElementById('history-student-id').value.trim();
+        var password = document.getElementById('history-password').value.trim();
+        var errorDiv = document.getElementById('history-auth-error');
+        var container = document.getElementById('history-content');
+        
+        errorDiv.style.display = 'none';
+        
+        if (!studentId) {
+          errorDiv.textContent = '⚠️ Please enter your Student ID.';
+          errorDiv.style.display = 'block';
+          return;
+        }
+        
+        if (!password || password.length < 4) {
+          errorDiv.textContent = '⚠️ Please enter your password (minimum 4 characters).';
+          errorDiv.style.display = 'block';
+          return;
+        }
+        
+        container.innerHTML = `<div class="loading"><div class="spinner"></div><p>Verifying credentials and loading history...</p></div>`;
+        
+        google.script.run
+          .withSuccessHandler(function(result) {
+            if (result.success) {
+              var studentInfo = result.student;
+              var headerHtml = `
+                <div style="background:#eef2ff;border-radius:12px;padding:12px 16px;margin-bottom:12px;border-left:4px solid #667eea;">
+                  <div style="font-weight:800;color:#0f172a;">👤 ${studentInfo.name}</div>
+                  <div style="font-size:0.85rem;color:#475569;">ID: ${studentInfo.id} | Class: ${studentInfo.class}</div>
+                </div>
+              `;
+              container.innerHTML = headerHtml;
+              renderMyHistory(result.history || []);
+            } else {
+              errorDiv.textContent = '❌ ' + result.message;
+              errorDiv.style.display = 'block';
+              container.innerHTML = `
+                <div class="history-empty">
+                  ❌ ${result.message}
+                  <br><br>
+                  <button onclick="showHistoryView()" style="padding:8px 16px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:700;">
+                    🔄 Try Again
+                  </button>
+                </div>
+              `;
+            }
+          })
+          .withFailureHandler(function(error) {
+            container.innerHTML = `
+              <div class="history-empty">
+                ❌ Error: ${error}
+                <br><br>
+                <button onclick="showHistoryView()" style="padding:8px 16px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:700;">
+                  🔄 Try Again
+                </button>
+              </div>
+            `;
+          })
+          .getStudentHistory(studentId, password);
+      }
+
+      function renderMyHistory(historyData) {
+        var container = document.getElementById('history-content');
+        if (!container) return;
+        
+        if (!historyData || historyData.length === 0) {
+          container.innerHTML += `
+            <div class="history-empty" style="margin-top:10px;">
+              📭 No quiz history found for this student.
+              <br><span style="font-size:0.8rem;color:#94a3b8;">Complete a quiz to see history here!</span>
+            </div>
+          `;
+          return;
+        }
+        
+        var totalAttempts = historyData.length;
+        var totalScore = 0;
+        historyData.forEach(function(e) { totalScore += parseInt(e.percentage) || 0; });
+        var avgScore = Math.round(totalScore / historyData.length);
+        var bestScore = 0;
+        historyData.forEach(function(e) { 
+          var p = parseInt(e.percentage) || 0;
+          if (p > bestScore) bestScore = p;
+        });
+        
+        var html = `
+          <div class="history-stats">
+            <div class="stat-box">
+              <div class="num">${totalAttempts}</div>
+              <div class="lbl">📝 Attempts</div>
+            </div>
+            <div class="stat-box">
+              <div class="num">${avgScore}%</div>
+              <div class="lbl">📊 Avg Score</div>
+            </div>
+            <div class="stat-box">
+              <div class="num">${bestScore}%</div>
+              <div class="lbl">🏆 Best Score</div>
+            </div>
+          </div>
+        `;
+        
+        historyData.forEach(function(entry) {
+          var date = entry.timestamp ? new Date(entry.timestamp) : null;
+          var dateStr = 'Date unavailable';
+          if (date && !isNaN(date.getTime())) {
+            dateStr = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+          }
+          var score = parseInt(entry.score) || 0;
+          var total = parseInt(entry.total) || 1;
+          var percentage = parseInt(entry.percentage) || 0;
+          var isPass = percentage >= 50;
+          
+          html += `
+            <div class="history-item" style="${isPass ? 'border-left:4px solid #059669;' : 'border-left:4px solid #dc2626;'}">
+              <div style="flex:1;min-width:120px;">
+                <div class="h-topic">${entry.chapter || 'Unknown'} - ${entry.topic || 'Unknown'}</div>
+                <div style="font-size:0.7rem;color:#94a3b8;">${dateStr}</div>
+              </div>
+              <div style="text-align:right;">
+                <span class="h-score" style="${isPass ? 'background:#d1fae5;color:#059669;' : 'background:#fee2e2;color:#dc2626;'}">
+                  ${score}/${total} (${percentage}%)
+                </span>
+              </div>
+            </div>
+          `;
+        });
+        
+        container.innerHTML += html;
+      }
+
+      function goBackFromHistory() {
+        showView(state.previousView);
+      }
+
+      function loadLeaderboard() {
+        var container = document.getElementById('leaderboard-container');
+        if (!container) return;
+        
+        if (!state.studentClass || !state.chapter || !state.topic) {
+          container.innerHTML = `
+            <div class="leaderboard-box">
+              <h3><span class="trophy">🏆</span> Leaderboard</h3>
+              <div class="leaderboard-empty">Complete a quiz to see the leaderboard!</div>
+            </div>
+          `;
+          return;
+        }
+        
+        container.innerHTML = `<div style="text-align:center;padding:12px;">
+          <div class="spinner" style="width:24px;height:24px;margin:0 auto 8px;"></div>
+          <p style="font-size:0.85rem;color:#64748b;">Loading leaderboard...</p>
+        </div>`;
+        
+        google.script.run
+          .withSuccessHandler(function(data) {
+            if (data && Array.isArray(data) && data.length > 0) {
+              renderLeaderboard(data);
+            } else {
+              container.innerHTML = `
+                <div class="leaderboard-box">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <h3 style="margin:0;"><span class="trophy">🏆</span> Leaderboard</h3>
+                    <button onclick="loadLeaderboard()" class="leaderboard-refresh-btn">🔄 Refresh</button>
+                  </div>
+                  <div class="leaderboard-empty">
+                    No scores yet for this topic.
+                    <br>Be the first to appear on the leaderboard!
+                  </div>
+                </div>
+              `;
+            }
+          })
+          .withFailureHandler(function(error) {
+            container.innerHTML = `
+              <div class="leaderboard-box">
+                <h3><span class="trophy">🏆</span> Leaderboard</h3>
+                <div class="leaderboard-empty" style="color:#dc2626;">
+                  ❌ Error: ${getErrorMessage(error)}
+                  <br><br>
+                  <button onclick="loadLeaderboard()" style="padding:8px 16px;background:#667eea;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:700;">
+                    🔄 Retry
+                  </button>
+                </div>
+              </div>
+            `;
+          })
+          .getLeaderboard(state.studentClass, state.chapter, state.topic);
+      }
+
+      function renderLeaderboard(data) {
+        var container = document.getElementById('leaderboard-container');
+        if (!container) return;
+        
+        var medals = ['🥇', '🥈', '🥉'];
+        var rankClasses = ['gold', 'silver', 'bronze'];
+        
+        var html = `
+          <div class="leaderboard-box">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <h3><span class="trophy">🏆</span> Top ${Math.min(5, data.length)}</h3>
+              <button onclick="loadLeaderboard()" class="leaderboard-refresh-btn">🔄 Refresh</button>
+            </div>
+        `;
+        
+        var displayCount = Math.min(5, data.length);
+        for (var i = 0; i < displayCount; i++) {
+          var item = data[i];
+          var medal = i < 3 ? medals[i] : '#' + (i+1);
+          var rankClass = i < 3 ? rankClasses[i] : '';
+          var isCurrentUser = (item.studentId === state.studentId || item.name === state.studentName);
+          
+          html += `
+            <div class="leaderboard-item ${isCurrentUser ? 'current-user' : ''}">
+              <span class="rank ${rankClass}">${medal}</span>
+              <div class="info">
+                <div class="name">${item.name || 'Unknown'} ${isCurrentUser ? '⭐' : ''}</div>
+                <div class="detail">${item.class || ''} ${item.studentId ? '| ID: ' + item.studentId : ''}</div>
+              </div>
+              <span class="score">${item.score || 0}/${item.total || 1} (${item.percentage || 0}%)</span>
+            </div>
+          `;
+        }
+        
+        html += `</div>`;
+        container.innerHTML = html;
+      }
+
+      function showFile() {
+        toggleFileMenu();
+      }
+
+      function loadStats(attempt) {
+        attempt = attempt || 0;
+
+        var totalEl = document.getElementById('total-questions');
+        var chaptersEl = document.getElementById('total-chapters');
+
+        if (!totalEl || !chaptersEl) return;
+
+        // Keep the stats visible while the Apps Script bridge connects.
+        if (attempt === 0) {
+          totalEl.textContent = '…';
+          chaptersEl.textContent = '…';
+        }
+
+        if (typeof google === 'undefined' || !google.script || !google.script.run) {
+          if (attempt < 10) {
+            setTimeout(function() { loadStats(attempt + 1); }, 500);
+          } else {
+            totalEl.textContent = '--';
+            chaptersEl.textContent = '--';
+          }
+          return;
+        }
+
+        google.script.run
+          .withSuccessHandler(function(data) {
+            data = data || {};
+            totalEl.textContent = Number(data.total) || 0;
+            chaptersEl.textContent = Number(data.chapters) || 0;
+          })
+          .withFailureHandler(function(error) {
+            console.error('Chem-Quiz: getStats failed:', error);
+            if (attempt < 10) {
+              setTimeout(function() { loadStats(attempt + 1); }, 700);
+            } else {
+              totalEl.textContent = '--';
+              chaptersEl.textContent = '--';
+            }
+          })
+          .getStats();
+      }
+
+      function showView(viewId) {
+        document.querySelectorAll('#quiz-views .view').forEach(function(el) {
+          el.classList.remove('active');
+        });
+        var target = document.getElementById(viewId);
+        if (target) {
+          target.classList.add('active');
+          document.querySelector('.container').scrollTop = 0;
+        }
+      }
+
+      function showLoading(elementId) {
+        document.getElementById(elementId).innerHTML = `
+          <div class="loading">
+            <div class="spinner"></div>
+            <p>Loading...</p>
+          </div>
+        `;
+      }
+
+      function loadChapters(classLevel) {
+        showLoading('chapter-list');
+        google.script.run
+          .withSuccessHandler(function(chapters) {
+            state.chapters = chapters;
+            state.allChapters = chapters;
+            renderChapters(chapters);
+            renderChapterSwitcher();
+          })
+          .withFailureHandler(function(error) {
+            document.getElementById('chapter-list').innerHTML = `<p style="color:#dc2626;text-align:center;padding:20px;font-weight:600;">❌ Error: ${error}</p>`;
+          })
+          .getChapters(classLevel);
+      }
+
+      // ========== RENDER CHAPTERS WITH FLASHCARD BADGE ==========
+      function renderChapters(chapters) {
+        var container = document.getElementById('chapter-list');
+        container.innerHTML = '';
+        if (chapters.length === 0) {
+          container.innerHTML = `<p style="color:#64748b;text-align:center;padding:20px;font-weight:600;font-size:0.9rem;">📚 No chapters available for your class yet.</p>`;
+          return;
+        }
+        
+        chapters.forEach(function(chapter) {
+          var btn = document.createElement('button');
+          btn.className = 'grid-btn';
+          btn.textContent = chapter;
+          
+          // Check if this chapter has flashcards
+          if (state.flashcardChapters && state.flashcardChapters.includes(chapter)) {
+            var badge = document.createElement('span');
+            badge.className = 'flashcard-badge';
+            badge.textContent = '🎴';
+            btn.appendChild(badge);
+          }
+          
+          btn.onclick = function() { 
+            state.chapter = chapter;
+            loadTopics(state.studentClass, chapter); 
+          };
+          container.appendChild(btn);
+        });
+        showView('class-view');
+      }
+
+      function loadTopics(classLevel, chapter) {
+        state.chapter = chapter;
+        document.getElementById('chapter-title').textContent = '📝 ' + chapter + ' - Topics';
+        document.getElementById('file-menu').style.display = 'none';
+        showLoading('topic-list');
+        google.script.run
+          .withSuccessHandler(function(topics) {
+            state.topics = topics;
+            renderTopics(topics);
+          })
+          .withFailureHandler(function(error) {
+            document.getElementById('topic-list').innerHTML = `<p style="color:#dc2626;text-align:center;padding:20px;font-weight:600;">❌ Error: ${error}</p>`;
+          })
+          .getTopics(classLevel, chapter);
+      }
+
+      function renderTopics(topics) {
+        var container = document.getElementById('topic-list');
+        container.innerHTML = '';
+        if (topics.length === 0) {
+          container.innerHTML = `<p style="color:#64748b;text-align:center;padding:20px;font-weight:600;font-size:0.9rem;">📝 No topics available for this chapter yet.</p>`;
+          return;
+        }
+        topics.forEach(function(topic) {
+          var btn = document.createElement('button');
+          btn.className = 'grid-btn';
+          btn.textContent = topic;
+          btn.onclick = function() { 
+            state.topic = topic;
+            loadQuestionCount(state.studentClass, state.chapter, topic); 
+          };
+          container.appendChild(btn);
+        });
+        showView('topic-view');
+      }
+
+      function loadQuestionCount(classLevel, chapter, topic) {
+        state.topic = topic;
+        document.getElementById('topic-title').textContent = '🔢 ' + topic + ' - How many questions?';
+        var counts = [5, 10, 15, 20];
+        var container = document.getElementById('count-list');
+        container.innerHTML = '';
+        counts.forEach(function(count) {
+          var btn = document.createElement('button');
+          btn.className = 'grid-btn';
+          btn.textContent = count + ' questions';
+          btn.onclick = function() { startQuiz(classLevel, chapter, topic, count); };
+          container.appendChild(btn);
+        });
+        var allBtn = document.createElement('button');
+        allBtn.className = 'grid-btn';
+        allBtn.textContent = '📚 All Questions';
+        allBtn.onclick = function() { startQuiz(classLevel, chapter, topic, 0); };
+        container.appendChild(allBtn);
+        showView('count-view');
+      }
+
+      function startQuiz(classLevel, chapter, topic, numQuestions) {
+        state.answers = {};
+        state.answerResults = {};
+        state.correctAnswers = {};
+        state.score = 0;
+        state.attempted = 0;
+        state.currentQuestionIndex = 0;
+        state.quizCompleted = false;
+        state.timer = 60;
+
+        document.getElementById('file-menu').style.display = 'none';
+        showLoading('quiz-header');
+        showView('quiz-view');
+
+        google.script.run
+          .withSuccessHandler(function(questions) {
+            state.questions = questions;
+            state.totalQuestions = questions.length;
+            document.getElementById('question-counter').textContent = '0 / ' + questions.length;
+            document.getElementById('score-display').textContent = '✅ 0 correct';
+            document.getElementById('quiz-header').textContent = '📝 ' + topic;
+            renderQuestion(0);
+            startTimer();
+          })
+          .withFailureHandler(function(error) {
+            document.getElementById('quiz-header').innerHTML = `<p style="color:#dc2626;text-align:center;padding:20px;font-weight:600;">❌ Error: ${error}</p>`;
+          })
+          .getQuestions(classLevel, chapter, topic, numQuestions);
+      }
+
+      function startTimer() {
+        if (state.timerInterval) clearInterval(state.timerInterval);
+        state.timer = 60;
+        updateTimerDisplay();
+
+        state.timerInterval = setInterval(function() {
+          state.timer--;
+          updateTimerDisplay();
+          if (state.timer <= 0) {
+            clearInterval(state.timerInterval);
+            state.timerInterval = null;
+            if (!state.quizCompleted) {
+              autoSubmitAllAndShowResults();
+            }
+          }
+        }, 1000);
+      }
+
+      function updateTimerDisplay() {
+        var display = document.getElementById('timer-display');
+        display.textContent = state.timer;
+        display.className = state.timer <= 10 ? 'timer-display warning' : 'timer-display';
+      }
+
+      function stopTimer() {
+        if (state.timerInterval) {
+          clearInterval(state.timerInterval);
+          state.timerInterval = null;
+        }
+      }
+
+      function autoSubmitAllAndShowResults() {
+        if (state.quizCompleted) return;
+        state.quizCompleted = true;
+        stopTimer();
+
+        var remaining = [];
+        state.questions.forEach(function(q, index) {
+          if (!state.answerResults[index] && state.answers[index]) {
+            remaining.push(index);
+          }
+        });
+
+        if (remaining.length > 0) {
+          var submitted = 0;
+          var totalRemaining = remaining.length;
+          remaining.forEach(function(index) {
+            var selected = state.answers[index];
+            var questionId = state.questions[index].id;
+            google.script.run
+              .withSuccessHandler(function(result) {
+                state.attempted++;
+                if (result.isCorrect) {
+                  state.score++;
+                  state.answerResults[index] = 'correct';
+                } else {
+                  state.answerResults[index] = 'wrong';
+                  state.correctAnswers[index] = result.correctAnswer;
+                }
+                submitted++;
+                if (submitted === totalRemaining) {
+                  submitResultsAndShow();
+                }
+              })
+              .withFailureHandler(function() {
+                submitted++;
+                if (submitted === totalRemaining) {
+                  submitResultsAndShow();
+                }
+              })
+              .submitAnswer(questionId, state.studentClass, state.chapter, state.topic, selected);
+          });
+        } else {
+          submitResultsAndShow();
+        }
+      }
+
+      function submitResultsAndShow() {
+        var email = state.studentEmail || '';
+        var whatsapp = state.studentWhatsApp || '';
+        
+        saveToHistory({
+          studentId: state.studentId,
+          name: state.studentName,
+          class: state.studentClass,
+          chapter: state.chapter,
+          topic: state.topic,
+          score: state.score,
+          total: state.totalQuestions,
+          attempted: state.attempted,
+          percentage: Math.round((state.score / state.totalQuestions) * 100),
+          date: new Date().toLocaleString()
+        });
+
+        google.script.run
+          .withSuccessHandler(function(result) {
+            console.log("✅ Quiz results saved:", result);
+            showResults();
+            loadLeaderboard();
+          })
+          .withFailureHandler(function(error) {
+            console.error("❌ Error saving quiz results:", error);
+            showResults();
+            loadLeaderboard();
+          })
+          .saveQuizResults(
+            state.studentId,
+            state.studentName,
+            state.studentClass,
+            state.chapter,
+            state.topic,
+            state.score,
+            state.totalQuestions,
+            state.attempted,
+            email,
+            whatsapp
+          );
+      }
+
+      function renderQuestion(index) {
+        var questions = state.questions;
+        if (!questions || questions.length === 0) {
+          document.getElementById('question-text').textContent = 'No questions available.';
+          return;
+        }
+
+        state.currentQuestionIndex = index;
+        var q = questions[index];
+
+        document.getElementById('question-progress').textContent = 'Question ' + (index + 1) + ' of ' + questions.length;
+        document.getElementById('question-text').textContent = q.text;
+        
+        if (q.imageUrl && q.imageUrl !== '' && q.imageUrl !== 'undefined' && q.imageUrl !== 'null') {
+          displayQuestionImage(q.imageUrl);
+        } else {
+          var container = document.getElementById('question-image-container');
+          container.innerHTML = '';
+          container.classList.add('hidden');
+        }
+
+        var container = document.getElementById('options-container');
+        container.innerHTML = '';
+
+        var letters = ['A', 'B', 'C', 'D'];
+        letters.forEach(function(letter, i) {
+          var btn = document.createElement('button');
+          btn.className = 'option-btn';
+          btn.innerHTML = '<span class="letter">' + letter + '</span> ' + q.options[i];
+          btn.onclick = function() { selectOption(letter); };
+
+          if (state.answers[index] === letter) {
+            btn.classList.add('selected');
+          }
+
+          container.appendChild(btn);
+        });
+
+        renderQuestionNav();
+
+        document.getElementById('submit-btn').disabled = (state.answerResults[index] || !state.answers[index]);
+
+        var answered = Object.keys(state.answers).length;
+        document.getElementById('question-counter').textContent = answered + ' / ' + questions.length;
+      }
+
+      function renderQuestionNav() {
+        var container = document.getElementById('question-nav');
+        container.innerHTML = '';
+
+        state.questions.forEach(function(q, index) {
+          var btn = document.createElement('button');
+          btn.className = 'question-nav-btn';
+          btn.textContent = index + 1;
+
+          if (state.answerResults[index]) {
+            btn.classList.add('answered');
+          } else if (state.answers[index]) {
+            btn.classList.add('answered');
+          }
+
+          if (index === state.currentQuestionIndex) {
+            btn.classList.add('current');
+          }
+
+          btn.onclick = function() { renderQuestion(index); };
+          container.appendChild(btn);
+        });
+      }
+
+      function selectOption(letter) {
+        var index = state.currentQuestionIndex;
+        state.selectedOption = letter;
+        state.answers[index] = letter;
+
+        var container = document.getElementById('options-container');
+        var buttons = container.querySelectorAll('.option-btn');
+        buttons.forEach(function(btn) {
+          btn.classList.remove('selected');
+          var btnLetter = btn.querySelector('.letter').textContent;
+          if (btnLetter === letter) {
+            btn.classList.add('selected');
+          }
+        });
+
+        document.getElementById('submit-btn').disabled = false;
+        renderQuestionNav();
+
+        var answered = Object.keys(state.answers).length;
+        document.getElementById('question-counter').textContent = answered + ' / ' + state.questions.length;
+      }
+
+      function submitAnswer() {
+        var index = state.currentQuestionIndex;
+        var selected = state.answers[index];
+
+        if (!selected) {
+          alert('Please select an option first!');
+          return;
+        }
+
+        if (state.answerResults[index]) {
+          alert('You have already answered this question.');
+          return;
+        }
+
+        document.getElementById('submit-btn').disabled = true;
+        
+        var questionId = state.questions[index].id;
+
+        google.script.run
+          .withSuccessHandler(function(result) {
+            state.attempted++;
+            if (result.isCorrect) {
+              state.score++;
+              state.answerResults[index] = 'correct';
+            } else {
+              state.answerResults[index] = 'wrong';
+              state.correctAnswers[index] = result.correctAnswer;
+            }
+
+            document.getElementById('score-display').textContent = '✅ ' + state.score + ' correct';
+            renderQuestionNav();
+            document.getElementById('submit-btn').disabled = true;
+
+            var answered = Object.keys(state.answers).length;
+            document.getElementById('question-counter').textContent = answered + ' / ' + state.questions.length;
+
+            stopTimer();
+            startTimer();
+
+            var nextIndex = index + 1;
+            if (nextIndex >= state.questions.length) {
+              stopTimer();
+              if (!state.quizCompleted) {
+                state.quizCompleted = true;
+                submitResultsAndShow();
+              }
+            } else {
+              renderQuestion(nextIndex);
+            }
+          })
+          .withFailureHandler(function(error) {
+            alert('Error submitting answer: ' + error);
+            document.getElementById('submit-btn').disabled = false;
+          })
+          .submitAnswer(questionId, state.studentClass, state.chapter, state.topic, selected);
+      }
+
+      function showResults() {
+        stopTimer();
+        var total = state.totalQuestions || state.questions.length;
+        var correct = state.score;
+        var wrong = state.attempted - correct;
+        var skip = total - state.attempted;
+        var percentage = total > 0 ? Math.round((correct / total) * 100) : 0;
+
+        var container = document.getElementById('results-content');
+
+        container.innerHTML = `
+          <div class="result-score">${correct} / ${total}</div>
+          <div class="result-percentage">${percentage}%</div>
+          <p style="color:#475569;font-weight:700;font-size:1rem;margin-top:4px;">${state.studentName}, here's how you did:</p>
+
+          <div class="result-stats">
+            <div class="result-stat">
+              <div class="label">✅ Right</div>
+              <div class="value correct">${correct}</div>
+            </div>
+            <div class="result-stat">
+              <div class="label">❌ Wrong</div>
+              <div class="value wrong">${wrong}</div>
+            </div>
+            <div class="result-stat">
+              <div class="label">⏭️ Skip</div>
+              <div class="value skip">${skip}</div>
+            </div>
+          </div>
+
+          <div style="margin-top:10px;padding:8px;background:#f1f5f9;border-radius:12px;font-size:0.85rem;font-weight:700;color:#475569;">
+            📊 Chapter: ${state.chapter} • Topic: ${state.topic}
+          </div>
+        `;
+
+        showView('results-view');
+        document.querySelector('.container').scrollTop = 0;
+      }
+
+      function retryWrongQuestions() {
+        var wrongIndices = [];
+        state.questions.forEach(function(q, index) {
+          if (state.answerResults[index] === 'wrong') {
+            wrongIndices.push(index);
+          }
+        });
+
+        if (wrongIndices.length === 0) {
+          alert('🎉 You got all questions correct! No wrong questions to retry.');
+          return;
+        }
+
+        var wrongQuestions = wrongIndices.map(function(index) {
+          return state.questions[index];
+        });
+
+        state.questions = wrongQuestions;
+        state.totalQuestions = wrongQuestions.length;
+        state.answers = {};
+        state.answerResults = {};
+        state.correctAnswers = {};
+        state.score = 0;
+        state.attempted = 0;
+        state.quizCompleted = false;
+        state.currentQuestionIndex = 0;
+        state.timer = 60;
+
+        document.getElementById('question-counter').textContent = '0 / ' + wrongQuestions.length;
+        document.getElementById('score-display').textContent = '✅ 0 correct';
+
+        showView('quiz-view');
+        document.getElementById('quiz-header').textContent = '🔄 Retrying Wrong Questions';
+        renderQuestion(0);
+        startTimer();
+      }
+
+      function retryAllQuestions() {
+        var allQuestions = state.questions.slice();
+
+        state.questions = allQuestions;
+        state.totalQuestions = allQuestions.length;
+        state.answers = {};
+        state.answerResults = {};
+        state.correctAnswers = {};
+        state.score = 0;
+        state.attempted = 0;
+        state.quizCompleted = false;
+        state.currentQuestionIndex = 0;
+        state.timer = 60;
+
+        document.getElementById('question-counter').textContent = '0 / ' + allQuestions.length;
+        document.getElementById('score-display').textContent = '✅ 0 correct';
+
+        showView('quiz-view');
+        document.getElementById('quiz-header').textContent = '🔄 Retrying All Questions';
+        renderQuestion(0);
+        startTimer();
+      }
+
+      function resetQuiz() {
+        stopTimer();
+        showView('class-view');
+        loadChapters(state.studentClass);
+      }
+
+      // ========== INITIALIZATION ==========
+
+      // If the bridge never becomes ready, show a useful console diagnostic.
+      setTimeout(function() {
+        if (typeof gasBridgeReady !== 'undefined' && !gasBridgeReady) {
+          console.error(
+            'Chem-Quiz: Apps Script bridge is not ready. ' +
+            'Check the Bridge.html deployment and /exec?page=bridge URL.'
+          );
+        }
+      }, 12000);
+
+      document.addEventListener('DOMContentLoaded', function() {
+        // InfinityFree bridge is initialized independently and queues these calls
+        // until the hidden Apps Script Bridge.html is ready.
+        loadAppLogo();
+        loadAnnouncementsTicker();
+        loadStats();
+
+        document.getElementById('splash-screen').style.display = 'flex';
+        document.getElementById('main-container').classList.remove('active');
+      });
+    </script>
+  </body>
+</html>
